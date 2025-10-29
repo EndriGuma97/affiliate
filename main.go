@@ -102,6 +102,7 @@ type Comment struct {
 	UserID    int
 	Username  string
 	Content   string
+	ImageURL  string
 	CreatedAt time.Time
 }
 
@@ -236,6 +237,8 @@ func setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/login", loginHandler)
 	mux.HandleFunc("/logout", logoutHandler)
 	mux.HandleFunc("/verify", verifyHandler)
+	mux.HandleFunc("/forgot-password", forgotPasswordHandler)
+	mux.HandleFunc("/reset-password", resetPasswordHandler)
 
 	// --- Places & Map Routes ---
 	mux.HandleFunc("/map", mapHandler)
@@ -249,9 +252,12 @@ func setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/places", placesAPIHandler)
 	mux.HandleFunc("/api/places/submit", submitPlaceHandler)
 	mux.HandleFunc("/api/comment", requireAuth(commentHandler))
+	mux.HandleFunc("/api/counseling/submit", counselingSubmitHandler)
 
 	// --- Protected Routes ---
 	mux.HandleFunc("/dashboard", requireAuth(dashboardHandler))
+	mux.HandleFunc("/change-password", requireAuth(changePasswordHandler))
+	mux.HandleFunc("/delete-account", requireAuth(deleteAccountHandler))
 
 	// --- Admin Routes ---
 	mux.HandleFunc("/admin/", requireAdmin(adminHandler))
@@ -280,7 +286,9 @@ func initDB(filepath string) (*sql.DB, error) {
 		is_verified BOOLEAN DEFAULT FALSE,
 		is_admin BOOLEAN DEFAULT FALSE,
 		verification_token TEXT,
-		token_expiry DATETIME
+		token_expiry DATETIME,
+		password_reset_token TEXT,
+		reset_token_expiry DATETIME
 	);`
 
 	createPlacesTable := `
@@ -304,6 +312,7 @@ func initDB(filepath string) (*sql.DB, error) {
 		place_id INTEGER NOT NULL,
 		user_id INTEGER NOT NULL,
 		content TEXT NOT NULL,
+		image_url TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY(place_id) REFERENCES places(id) ON DELETE CASCADE,
 		FOREIGN KEY(user_id) REFERENCES users(id)
@@ -318,6 +327,11 @@ func initDB(filepath string) (*sql.DB, error) {
 	if _, err = db.Exec(createCommentsTable); err != nil {
 		return nil, err
 	}
+
+	// Add columns to existing tables if they don't exist
+	db.Exec("ALTER TABLE users ADD COLUMN password_reset_token TEXT")
+	db.Exec("ALTER TABLE users ADD COLUMN reset_token_expiry DATETIME")
+	db.Exec("ALTER TABLE comments ADD COLUMN image_url TEXT")
 
 	// Add sample admin user if not exists
 	var count int
@@ -542,6 +556,161 @@ func verifyHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		user, _ := getCurrentUser(r)
+		renderTemplate(w, "forgot_password", PageBundle{
+			CurrentUser: user,
+		})
+		return
+	}
+
+	// Handle POST
+	email := r.FormValue("email")
+
+	var userID int
+	var username string
+	err := db.QueryRow("SELECT id, username FROM users WHERE email = ?", email).Scan(&userID, &username)
+
+	if err != nil {
+		// Don't reveal if email exists or not for security
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Password Reset Email Sent",
+				Message: "If an account exists with this email, a password reset link has been sent.",
+			},
+		})
+		return
+	}
+
+	// Generate reset token
+	token := generateToken()
+	expiry := time.Now().Add(1 * time.Hour) // 1 hour expiry
+
+	// Update user with reset token
+	_, err = db.Exec(
+		"UPDATE users SET password_reset_token = ?, reset_token_expiry = ? WHERE id = ?",
+		token, expiry, userID,
+	)
+	if err != nil {
+		log.Printf("Error setting reset token: %v", err)
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "An error occurred. Please try again later.",
+			},
+		})
+		return
+	}
+
+	// Send password reset email
+	resetLink := fmt.Sprintf("%s/reset-password?token=%s", baseURL, token)
+	emailBody := fmt.Sprintf("Hello %s,\n\nYou requested a password reset. Click the link below to reset your password:\n\n%s\n\nThis link expires in 1 hour.\n\nIf you didn't request this, please ignore this email.", username, resetLink)
+
+	if err := sendEmail(email, "Password Reset Request", emailBody); err != nil {
+		log.Printf("Failed to send reset email: %v", err)
+	}
+
+	renderTemplate(w, "message", PageBundle{
+		Data: MessagePageData{
+			Title:   "Password Reset Email Sent",
+			Message: "If an account exists with this email, a password reset link has been sent.",
+		},
+	})
+}
+
+func resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+
+	if r.Method == http.MethodGet {
+		// Verify token exists and is valid
+		var count int
+		err := db.QueryRow(
+			"SELECT COUNT(*) FROM users WHERE password_reset_token = ? AND reset_token_expiry > ?",
+			token, time.Now(),
+		).Scan(&count)
+
+		if err != nil || count == 0 {
+			renderTemplate(w, "message", PageBundle{
+				Data: MessagePageData{
+					Title:   "Invalid Reset Link",
+					Message: "This password reset link is invalid or has expired.",
+				},
+			})
+			return
+		}
+
+		user, _ := getCurrentUser(r)
+		renderTemplate(w, "reset_password", PageBundle{
+			CurrentUser: user,
+			Data: map[string]string{
+				"token": token,
+			},
+		})
+		return
+	}
+
+	// Handle POST
+	newPassword := r.FormValue("password")
+	confirmPassword := r.FormValue("confirm_password")
+
+	if newPassword != confirmPassword {
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Password Mismatch",
+				Message: "Passwords do not match.",
+			},
+		})
+		return
+	}
+
+	// Hash new password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "Failed to process password.",
+			},
+		})
+		return
+	}
+
+	// Update password and clear reset token
+	result, err := db.Exec(
+		"UPDATE users SET password_hash = ?, password_reset_token = NULL, reset_token_expiry = NULL WHERE password_reset_token = ? AND reset_token_expiry > ?",
+		string(hashedPassword), token, time.Now(),
+	)
+
+	if err != nil {
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "An error occurred. Please try again.",
+			},
+		})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Invalid Reset Link",
+				Message: "This password reset link is invalid or has expired.",
+			},
+		})
+		return
+	}
+
+	renderTemplate(w, "message", PageBundle{
+		Data: MessagePageData{
+			Title:   "Password Reset Successful",
+			Message: "Your password has been reset successfully. You can now log in with your new password.",
+		},
+	})
+}
+
 // --- PROTECTED HANDLERS ---
 func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	user := r.Context().Value("user").(User)
@@ -551,6 +720,162 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 			CurrentUser: user,
 		},
 		CurrentUser: user,
+	})
+}
+
+func changePasswordHandler(w http.ResponseWriter, r *http.Request) {
+	user := r.Context().Value("user").(User)
+
+	if r.Method == http.MethodGet {
+		renderTemplate(w, "change_password", PageBundle{
+			PageName:    "change_password",
+			CurrentUser: user,
+		})
+		return
+	}
+
+	// Handle POST
+	currentPassword := r.FormValue("current_password")
+	newPassword := r.FormValue("new_password")
+	confirmPassword := r.FormValue("confirm_password")
+
+	// Verify current password
+	var storedHash string
+	err := db.QueryRow("SELECT password_hash FROM users WHERE id = ?", user.ID).Scan(&storedHash)
+	if err != nil || bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(currentPassword)) != nil {
+		renderTemplate(w, "change_password", PageBundle{
+			PageName:    "change_password",
+			CurrentUser: user,
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "Current password is incorrect.",
+			},
+		})
+		return
+	}
+
+	// Verify new passwords match
+	if newPassword != confirmPassword {
+		renderTemplate(w, "change_password", PageBundle{
+			PageName:    "change_password",
+			CurrentUser: user,
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "New passwords do not match.",
+			},
+		})
+		return
+	}
+
+	// Hash new password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		renderTemplate(w, "change_password", PageBundle{
+			PageName:    "change_password",
+			CurrentUser: user,
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "Failed to process password.",
+			},
+		})
+		return
+	}
+
+	// Update password
+	_, err = db.Exec("UPDATE users SET password_hash = ? WHERE id = ?", string(hashedPassword), user.ID)
+	if err != nil {
+		renderTemplate(w, "change_password", PageBundle{
+			PageName:    "change_password",
+			CurrentUser: user,
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "Failed to update password.",
+			},
+		})
+		return
+	}
+
+	renderTemplate(w, "message", PageBundle{
+		Data: MessagePageData{
+			Title:   "Password Changed",
+			Message: "Your password has been changed successfully.",
+		},
+	})
+}
+
+func deleteAccountHandler(w http.ResponseWriter, r *http.Request) {
+	user := r.Context().Value("user").(User)
+
+	if r.Method == http.MethodGet {
+		renderTemplate(w, "delete_account", PageBundle{
+			PageName:    "delete_account",
+			CurrentUser: user,
+		})
+		return
+	}
+
+	// Handle POST
+	password := r.FormValue("password")
+	confirmation := r.FormValue("confirmation")
+
+	// Verify password
+	var storedHash string
+	err := db.QueryRow("SELECT password_hash FROM users WHERE id = ?", user.ID).Scan(&storedHash)
+	if err != nil || bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		renderTemplate(w, "delete_account", PageBundle{
+			PageName:    "delete_account",
+			CurrentUser: user,
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "Password is incorrect.",
+			},
+		})
+		return
+	}
+
+	// Verify confirmation text
+	if confirmation != "DELETE" {
+		renderTemplate(w, "delete_account", PageBundle{
+			PageName:    "delete_account",
+			CurrentUser: user,
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "Please type DELETE to confirm account deletion.",
+			},
+		})
+		return
+	}
+
+	// Delete user's comments
+	db.Exec("DELETE FROM comments WHERE user_id = ?", user.ID)
+
+	// Delete user's places
+	db.Exec("DELETE FROM places WHERE submitted_by_user_id = ?", user.ID)
+
+	// Delete user account
+	_, err = db.Exec("DELETE FROM users WHERE id = ?", user.ID)
+	if err != nil {
+		renderTemplate(w, "delete_account", PageBundle{
+			PageName:    "delete_account",
+			CurrentUser: user,
+			Data: MessagePageData{
+				Title:   "Error",
+				Message: "Failed to delete account.",
+			},
+		})
+		return
+	}
+
+	// Clear session
+	session, _ := store.Get(r, "session")
+	delete(session.Values, "user_id")
+	session.Save(r, w)
+
+	renderTemplate(w, "message", PageBundle{
+		Data: MessagePageData{
+			Title:   "Account Deleted",
+			Message: "Your account has been permanently deleted.",
+		},
 	})
 }
 
@@ -867,7 +1192,7 @@ func placeDetailHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Get comments
 	rows, err := db.Query(`
-		SELECT c.id, c.content, c.created_at, u.username
+		SELECT c.id, c.content, c.image_url, c.created_at, u.username
 		FROM comments c
 		JOIN users u ON c.user_id = u.id
 		WHERE c.place_id = ?
@@ -881,7 +1206,11 @@ func placeDetailHandler(w http.ResponseWriter, r *http.Request) {
 	var comments []Comment
 	for rows.Next() {
 		var c Comment
-		rows.Scan(&c.ID, &c.Content, &c.CreatedAt, &c.Username)
+		var imageURL sql.NullString
+		rows.Scan(&c.ID, &c.Content, &imageURL, &c.CreatedAt, &c.Username)
+		if imageURL.Valid {
+			c.ImageURL = imageURL.String
+		}
 		comments = append(comments, c)
 	}
 
@@ -950,6 +1279,7 @@ func commentHandler(w http.ResponseWriter, r *http.Request) {
 	user := r.Context().Value("user").(User)
 	placeID, _ := strconv.Atoi(r.FormValue("place_id"))
 	content := r.FormValue("content")
+	imageURL := r.FormValue("image_url")
 
 	if content == "" {
 		http.Error(w, "Comment cannot be empty", http.StatusBadRequest)
@@ -957,9 +1287,9 @@ func commentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_, err := db.Exec(`
-		INSERT INTO comments (place_id, user_id, content)
-		VALUES (?, ?, ?)
-	`, placeID, user.ID, content)
+		INSERT INTO comments (place_id, user_id, content, image_url)
+		VALUES (?, ?, ?, ?)
+	`, placeID, user.ID, content, imageURL)
 
 	if err != nil {
 		log.Printf("Error adding comment: %v", err)
@@ -988,6 +1318,88 @@ func counselingHandler(w http.ResponseWriter, r *http.Request) {
 		PageName:    "counseling",
 		CurrentUser: user,
 	})
+}
+
+func counselingSubmitHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Parse form data
+	name := r.FormValue("name")
+	email := r.FormValue("email")
+	date := r.FormValue("date")
+	message := r.FormValue("message")
+
+	// Validate required fields
+	if name == "" || email == "" || date == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "error",
+			"message": "Name, email, and date are required.",
+		})
+		return
+	}
+
+	// Prepare email body
+	emailBody := fmt.Sprintf(`New Consultation Request
+
+Name: %s
+Email: %s
+Preferred Date: %s
+Message: %s
+
+This request was submitted through the Kosovo Explorer website.
+`, name, email, date, message)
+
+	// Send email to both recipients
+	recipients := []string{
+		"atattersall@needgreatersglobal.com",
+		"andrewgouma@gmail.com",
+	}
+
+	var sendErrors []string
+	for _, recipient := range recipients {
+		err := sendEmail(recipient, "New Consultation Request from "+name, emailBody)
+		if err != nil {
+			log.Printf("Failed to send email to %s: %v", recipient, err)
+			sendErrors = append(sendErrors, recipient)
+		}
+	}
+
+	// Send confirmation email to user
+	confirmationBody := fmt.Sprintf(`Hello %s,
+
+Thank you for your consultation request with Abel Tattersall.
+
+Your request details:
+- Preferred Date: %s
+- Message: %s
+
+We will review your request and get back to you soon.
+
+Best regards,
+Kosovo Explorer Team
+`, name, date, message)
+
+	if err := sendEmail(email, "Consultation Request Received", confirmationBody); err != nil {
+		log.Printf("Failed to send confirmation email to %s: %v", email, err)
+	}
+
+	// Return response
+	w.Header().Set("Content-Type", "application/json")
+	if len(sendErrors) > 0 {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "partial",
+			"message": "Request received but some emails failed to send. We will still process your request.",
+		})
+	} else {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "success",
+			"message": "Your consultation request has been submitted successfully. You will receive a confirmation email shortly.",
+		})
+	}
 }
 
 // --- API HANDLERS ---
@@ -1887,6 +2299,9 @@ const allTemplates = `
                 <label for="password">Password</label>
                 <input type="password" id="password" name="password" required>
             </div>
+            <p style="text-align: right; margin-bottom: 1rem;">
+                <a href="/forgot-password" style="color: var(--text-gray); font-size: 0.9rem;">Forgot password?</a>
+            </p>
             <button type="submit" class="btn" style="width: 100%;">Log In</button>
             <p style="text-align: center; margin-top: 1rem; color: var(--text-gray);">
                 Don't have an account? <a href="/register" style="color: #667eea;">Sign up</a>
@@ -1945,6 +2360,20 @@ const allTemplates = `
                 <a href="/admin/" class="btn" style="margin-top: 1rem;">Admin Dashboard</a>
             </div>
             {{end}}
+        </div>
+
+        <h2 style="margin-top: 3rem; margin-bottom: 1rem;">Account Settings</h2>
+        <div class="card-grid">
+            <div class="card">
+                <h3>🔐 Change Password</h3>
+                <p>Update your account password for security.</p>
+                <a href="/change-password" class="btn" style="margin-top: 1rem;">Change Password</a>
+            </div>
+            <div class="card" style="border-color: rgba(244, 67, 54, 0.3);">
+                <h3 style="color: #f44336;">🗑️ Delete Account</h3>
+                <p>Permanently delete your account and all data.</p>
+                <a href="/delete-account" class="btn" style="margin-top: 1rem; background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%);">Delete Account</a>
+            </div>
         </div>
     </div>
 </div>
@@ -2408,6 +2837,11 @@ const allTemplates = `
                 <label for="content">Add a comment</label>
                 <textarea id="content" name="content" rows="3" required placeholder="Share your experience..."></textarea>
             </div>
+            <div class="form-group">
+                <label for="image_url">Image URL (optional)</label>
+                <input type="url" id="image_url" name="image_url" placeholder="https://example.com/image.jpg">
+                <small style="color: var(--text-gray); font-size: 0.85rem;">Add a single image to your comment by providing a URL</small>
+            </div>
             <button type="submit" class="btn">Post Comment</button>
         </form>
         {{else}}
@@ -2415,7 +2849,7 @@ const allTemplates = `
             <a href="/login" style="color: #667eea;">Login</a> to leave a comment
         </p>
         {{end}}
-        
+
         {{range .Data.Comments}}
         <div class="comment">
             <div class="comment-header">
@@ -2425,6 +2859,11 @@ const allTemplates = `
             <div class="comment-content">
                 {{.Content}}
             </div>
+            {{if .ImageURL}}
+            <div style="margin-top: 1rem;">
+                <img src="{{.ImageURL}}" alt="Comment image" style="max-width: 100%; max-height: 400px; border-radius: 10px; object-fit: contain;">
+            </div>
+            {{end}}
         </div>
         {{else}}
         <p style="color: var(--text-gray);">No comments yet. Be the first to share your thoughts!</p>
@@ -2613,10 +3052,12 @@ function handleQuickConsult(event) {
     <div class="form-card">
         <h1>Book an Appointment</h1>
         <p style="text-align: center; color: var(--text-gray); margin-bottom: 2rem;">
-            This is a placeholder form for booking an appointment with Abel Tattersall.
+            Schedule a consultation with Abel Tattersall for professional consulting services.
         </p>
-        
-        <form onsubmit="alert('This form is a placeholder.'); return false;">
+
+        <div id="counseling-message" style="display: none; padding: 1rem; border-radius: 10px; margin-bottom: 1rem;"></div>
+
+        <form id="counseling-form">
             <div class="form-group">
                 <label for="name">Full Name</label>
                 <input type="text" id="name" name="name" required placeholder="Your Full Name">
@@ -2635,6 +3076,179 @@ function handleQuickConsult(event) {
             </div>
             <button type="submit" class="btn">Submit Request</button>
         </form>
+    </div>
+</div>
+
+<script>
+document.getElementById('counseling-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+
+    const formData = new FormData(e.target);
+    const messageDiv = document.getElementById('counseling-message');
+    const submitBtn = e.target.querySelector('button[type="submit"]');
+
+    // Disable submit button
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Submitting...';
+
+    try {
+        const response = await fetch('/api/counseling/submit', {
+            method: 'POST',
+            body: formData
+        });
+
+        const data = await response.json();
+
+        // Show message
+        messageDiv.style.display = 'block';
+        if (data.status === 'success' || data.status === 'partial') {
+            messageDiv.style.backgroundColor = 'rgba(76, 175, 80, 0.2)';
+            messageDiv.style.border = '1px solid rgba(76, 175, 80, 0.5)';
+            messageDiv.textContent = data.message;
+            e.target.reset();
+        } else {
+            messageDiv.style.backgroundColor = 'rgba(244, 67, 54, 0.2)';
+            messageDiv.style.border = '1px solid rgba(244, 67, 54, 0.5)';
+            messageDiv.textContent = data.message || 'An error occurred. Please try again.';
+        }
+    } catch (error) {
+        messageDiv.style.display = 'block';
+        messageDiv.style.backgroundColor = 'rgba(244, 67, 54, 0.2)';
+        messageDiv.style.border = '1px solid rgba(244, 67, 54, 0.5)';
+        messageDiv.textContent = 'An error occurred. Please try again later.';
+    } finally {
+        // Re-enable submit button
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Submit Request';
+    }
+});
+</script>
+{{end}}
+
+{{define "forgot_password"}}
+{{template "layout" .}}
+<div class="container">
+    <div class="form-card">
+        <h1>Forgot Password</h1>
+        <p style="text-align: center; color: var(--text-gray); margin-bottom: 2rem;">
+            Enter your email address and we'll send you a password reset link.
+        </p>
+
+        <form method="POST" action="/forgot-password">
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <input type="email" id="email" name="email" required placeholder="your@email.com">
+            </div>
+            <button type="submit" class="btn">Send Reset Link</button>
+        </form>
+
+        <p style="text-align: center; margin-top: 1.5rem;">
+            <a href="/login" style="color: var(--text-gray);">Back to Login</a>
+        </p>
+    </div>
+</div>
+{{end}}
+
+{{define "reset_password"}}
+{{template "layout" .}}
+<div class="container">
+    <div class="form-card">
+        <h1>Reset Password</h1>
+        <p style="text-align: center; color: var(--text-gray); margin-bottom: 2rem;">
+            Enter your new password below.
+        </p>
+
+        {{if .Data}}
+        <form method="POST" action="/reset-password?token={{index .Data "token"}}">
+            <div class="form-group">
+                <label for="password">New Password</label>
+                <input type="password" id="password" name="password" required minlength="6" placeholder="At least 6 characters">
+            </div>
+            <div class="form-group">
+                <label for="confirm_password">Confirm Password</label>
+                <input type="password" id="confirm_password" name="confirm_password" required placeholder="Re-enter your password">
+            </div>
+            <button type="submit" class="btn">Reset Password</button>
+        </form>
+        {{end}}
+    </div>
+</div>
+{{end}}
+
+{{define "change_password"}}
+{{template "layout" .}}
+<div class="container">
+    <div class="form-card">
+        <h1>Change Password</h1>
+        <p style="text-align: center; color: var(--text-gray); margin-bottom: 2rem;">
+            Update your account password.
+        </p>
+
+        {{if .Data}}
+            {{if .Data.Message}}
+            <div style="padding: 1rem; border-radius: 10px; margin-bottom: 1rem; background-color: rgba(244, 67, 54, 0.2); border: 1px solid rgba(244, 67, 54, 0.5);">
+                {{.Data.Message}}
+            </div>
+            {{end}}
+        {{end}}
+
+        <form method="POST" action="/change-password">
+            <div class="form-group">
+                <label for="current_password">Current Password</label>
+                <input type="password" id="current_password" name="current_password" required>
+            </div>
+            <div class="form-group">
+                <label for="new_password">New Password</label>
+                <input type="password" id="new_password" name="new_password" required minlength="6" placeholder="At least 6 characters">
+            </div>
+            <div class="form-group">
+                <label for="confirm_password">Confirm New Password</label>
+                <input type="password" id="confirm_password" name="confirm_password" required>
+            </div>
+            <button type="submit" class="btn">Change Password</button>
+        </form>
+
+        <p style="text-align: center; margin-top: 1.5rem;">
+            <a href="/dashboard" style="color: var(--text-gray);">Back to Dashboard</a>
+        </p>
+    </div>
+</div>
+{{end}}
+
+{{define "delete_account"}}
+{{template "layout" .}}
+<div class="container">
+    <div class="form-card">
+        <h1 style="color: #f44336;">Delete Account</h1>
+        <p style="text-align: center; color: var(--text-gray); margin-bottom: 2rem;">
+            This action cannot be undone. All your data will be permanently deleted.
+        </p>
+
+        {{if .Data}}
+            {{if .Data.Message}}
+            <div style="padding: 1rem; border-radius: 10px; margin-bottom: 1rem; background-color: rgba(244, 67, 54, 0.2); border: 1px solid rgba(244, 67, 54, 0.5);">
+                {{.Data.Message}}
+            </div>
+            {{end}}
+        {{end}}
+
+        <form method="POST" action="/delete-account" onsubmit="return confirm('Are you absolutely sure? This cannot be undone!');">
+            <div class="form-group">
+                <label for="password">Confirm Your Password</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <div class="form-group">
+                <label for="confirmation">Type "DELETE" to confirm</label>
+                <input type="text" id="confirmation" name="confirmation" required placeholder="Type DELETE">
+            </div>
+            <button type="submit" class="btn" style="background: linear-gradient(135deg, #f44336 0%, #d32f2f 100%);">
+                Delete My Account
+            </button>
+        </form>
+
+        <p style="text-align: center; margin-top: 1.5rem;">
+            <a href="/dashboard" style="color: var(--text-gray);">Cancel and go back</a>
+        </p>
     </div>
 </div>
 {{end}}
