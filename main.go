@@ -46,18 +46,23 @@ var (
 
 // --- AI SYSTEM PROMPT ---
 const aiSystemPrompt = `
-You are a simple classification bot for a consulting website.
-Your ONLY job is to read the user's prompt and classify their intent.
-You MUST respond with ONLY ONE WORD from the following list:
-- "counseling" (if they ask about appointments, booking, consulting, or Abel Tattersall)
-- "places" (if they ask to find, see, recommend, or search for any location, place, food, or hike in Kosovo)
-- "other" (for anything else, like "hello", "what is this?", etc.)
+You are a classification bot for a Kosovo tourism and consulting website.
+Your job is to understand what the user wants and classify their intent.
+
+Respond with ONLY ONE WORD from this list:
+- "counseling" - if they want appointments, booking, consulting, therapy, or mention Abel Tattersall
+- "places" - if they want to find, see, visit, explore ANY location, attraction, or place in Kosovo
+- "other" - for general greetings or unrelated questions
 
 Examples:
-User: "I need to book an appointment" -> counseling
-User: "Recommend a place to hike" -> places
-User: "Who are you?" -> other
-User: "Find Prizren Castle" -> places
+User: "I want to see castles" -> places
+User: "Show me historical sites" -> places
+User: "Where can I find good restaurants?" -> places
+User: "I need therapy" -> counseling
+User: "Book a consultation" -> counseling
+User: "Hello" -> other
+User: "What museums are there?" -> places
+User: "I want to visit Prizren" -> places
 `
 
 // --- MODELS ---
@@ -959,60 +964,71 @@ func counselingHandler(w http.ResponseWriter, r *http.Request) {
 
 // --- API HANDLERS ---
 func chatAPIHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
 
-	var req AIChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+    var req AIChatRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
 
-	// Call Gemini AI
-	intent, err := classifyIntent(req.Prompt)
-	if err != nil {
-		log.Printf("AI classification error: %v", err)
-		// Fallback to keyword-based classification
-		intent = fallbackClassification(req.Prompt)
-	}
+    // Call Gemini AI for classification
+    intent, err := classifyIntent(req.Prompt)
+    if err != nil {
+        log.Printf("AI classification error: %v", err)
+        // Fallback to keyword-based classification
+        intent = fallbackClassification(req.Prompt)
+    }
 
-	var response AIChatResponse
+    var response AIChatResponse
 
-	switch intent {
-	case "counseling":
-		response = AIChatResponse{
-			Type:    "counseling",
-			Content: "I can help you book an appointment with Abel Tattersall. He offers professional consulting services. Would you like to schedule a session?",
-		}
+    switch intent {
+    case "counseling":
+        // Return counseling response with form option
+        response = AIChatResponse{
+            Type:    "counseling",
+            Content: map[string]interface{}{
+                "message": "I can help you book a consultation with Abel Tattersall. He offers professional consulting services.",
+                "showForm": true,
+            },
+        }
 
-	case "places":
-		// Search for places in database
-		places := searchPlaces(req.Prompt)
-		if len(places) > 0 {
-			response = AIChatResponse{
-				Type:    "places",
-				Content: places,
-			}
-		} else {
-			response = AIChatResponse{
-				Type:    "places",
-				Content: "I couldn't find any specific places matching your request. Try browsing all places or submit a new location!",
-			}
-		}
+    case "places":
+        // Search for places in database
+        places := searchPlaces(req.Prompt)
+        if len(places) > 0 {
+            response = AIChatResponse{
+                Type:    "places",
+                Content: map[string]interface{}{
+                    "message": fmt.Sprintf("I found %d place(s) matching your interest:", len(places)),
+                    "places": places,
+                },
+            }
+        } else {
+            response = AIChatResponse{
+                Type:    "places", 
+                Content: map[string]interface{}{
+                    "message": "I couldn't find any specific places matching your request. Try being more specific or browse all places.",
+                    "places": []Place{},
+                },
+            }
+        }
 
-	default:
-		response = AIChatResponse{
-			Type:    "other",
-			Content: "I can help you with two things: booking appointments with Abel Tattersall, or finding interesting places to visit in Kosovo. What would you like to know?",
-		}
-	}
+    default:
+        response = AIChatResponse{
+            Type:    "other",
+            Content: map[string]interface{}{
+                "message": "I can help you find interesting places in Kosovo or book a consultation with Abel Tattersall. What would you like to do?",
+            },
+        }
+    }
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(response)
 }
-
 func placesAPIHandler(w http.ResponseWriter, r *http.Request) {
 	// Get approved places for the map
 	rows, err := db.Query(`
@@ -1092,60 +1108,122 @@ func classifyIntent(prompt string) (string, error) {
 }
 
 func fallbackClassification(prompt string) string {
-	lowerPrompt := strings.ToLower(prompt)
-	
-	// Counseling keywords
-	counselingKeywords := []string{"appointment", "book", "schedule", "abel", "tattersall", "consulting", "session", "meeting"}
-	for _, keyword := range counselingKeywords {
-		if strings.Contains(lowerPrompt, keyword) {
-			return "counseling"
-		}
-	}
-
-	// Places keywords
-	placesKeywords := []string{"place", "visit", "find", "recommend", "where", "location", "hike", "food", "restaurant", "castle", "prizren", "kosovo"}
-	for _, keyword := range placesKeywords {
-		if strings.Contains(lowerPrompt, keyword) {
-			return "places"
-		}
-	}
-
-	return "other"
+    lowerPrompt := strings.ToLower(prompt)
+    
+    // Expanded counseling keywords
+    counselingKeywords := []string{
+        "appointment", "book", "schedule", "abel", "tattersall", 
+        "consulting", "consultation", "session", "meeting", "therapy",
+        "counseling", "advice", "help me with", "coaching",
+    }
+    
+    // Expanded places keywords
+    placesKeywords := []string{
+        "place", "visit", "find", "recommend", "where", "location", 
+        "hike", "food", "restaurant", "castle", "prizren", "kosovo",
+        "museum", "monument", "church", "mosque", "park", "nature",
+        "historical", "heritage", "tourist", "attraction", "see",
+        "explore", "discover", "go to", "travel", "trip", "tour",
+        "shopping", "market", "bazaar", "things to do",
+    }
+    
+    // Check counseling keywords first (higher priority)
+    for _, keyword := range counselingKeywords {
+        if strings.Contains(lowerPrompt, keyword) {
+            return "counseling"
+        }
+    }
+    
+    // Then check places keywords
+    for _, keyword := range placesKeywords {
+        if strings.Contains(lowerPrompt, keyword) {
+            return "places"
+        }
+    }
+    
+    return "other"
 }
 
 func searchPlaces(prompt string) []Place {
-	var places []Place
-	
-	// Simple keyword search
-	searchTerm := "%" + strings.ToLower(prompt) + "%"
-	
-	rows, err := db.Query(`
-		SELECT p.id, p.title, p.description, p.category, p.latitude, p.longitude,
-		       p.google_maps_link, p.created_at, u.username
-		FROM places p
-		JOIN users u ON p.submitted_by_user_id = u.id
-		WHERE p.is_approved = TRUE
-		  AND (LOWER(p.title) LIKE ? OR LOWER(p.description) LIKE ? OR LOWER(p.category) LIKE ?)
-		ORDER BY p.created_at DESC
-		LIMIT 5
-	`, searchTerm, searchTerm, searchTerm)
-
-	if err != nil {
-		log.Printf("Error searching places: %v", err)
-		return places
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var p Place
-		rows.Scan(&p.ID, &p.Title, &p.Description, &p.Category, &p.Latitude,
-			&p.Longitude, &p.GoogleMapsLink, &p.CreatedAt, &p.SubmittedByUsername)
-		places = append(places, p)
-	}
-
-	return places
+    var places []Place
+    
+    // Convert prompt to lowercase for better matching
+    lowerPrompt := strings.ToLower(prompt)
+    
+    // Extract key search terms from the prompt
+    var searchTerms []string
+    
+    // Common place-related keywords to search for
+    placeKeywords := map[string][]string{
+        "castle": {"castle", "fortress", "fort", "kala", "kalaja"},
+        "museum": {"museum", "gallery", "art", "history"},
+        "restaurant": {"restaurant", "food", "dining", "eat", "cuisine"},
+        "nature": {"park", "mountain", "lake", "hiking", "trail", "nature"},
+        "church": {"church", "cathedral", "monastery", "mosque", "temple"},
+        "historical": {"historical", "heritage", "ancient", "old", "monument"},
+        "shopping": {"shop", "mall", "market", "bazaar", "store"},
+    }
+    
+    // Check which keywords are in the prompt
+    for _, synonyms := range placeKeywords {
+        for _, synonym := range synonyms {
+            if strings.Contains(lowerPrompt, synonym) {
+                searchTerms = append(searchTerms, synonyms...)
+                break
+            }
+        }
+    }
+    
+    // If no specific keywords found, use general search
+    if len(searchTerms) == 0 {
+        // Extract potential search terms from prompt
+        words := strings.Fields(lowerPrompt)
+        for _, word := range words {
+            // Skip common words
+            if len(word) > 3 && word != "want" && word != "show" && word != "find" && word != "where" {
+                searchTerms = append(searchTerms, word)
+            }
+        }
+    }
+    
+    // Build SQL query with OR conditions for all search terms
+    if len(searchTerms) > 0 {
+        query := `
+            SELECT DISTINCT p.id, p.title, p.description, p.category, p.latitude, p.longitude,
+                   p.google_maps_link, p.created_at, u.username
+            FROM places p
+            JOIN users u ON p.submitted_by_user_id = u.id
+            WHERE p.is_approved = TRUE AND (`
+        
+        conditions := []string{}
+        args := []interface{}{}
+        
+        for _, term := range searchTerms {
+            conditions = append(conditions, 
+                "(LOWER(p.title) LIKE ? OR LOWER(p.description) LIKE ? OR LOWER(p.category) LIKE ?)")
+            searchPattern := "%" + term + "%"
+            args = append(args, searchPattern, searchPattern, searchPattern)
+        }
+        
+        query += strings.Join(conditions, " OR ") + ") ORDER BY p.created_at DESC LIMIT 10"
+        
+        rows, err := db.Query(query, args...)
+        if err != nil {
+            log.Printf("Error searching places: %v", err)
+            return places
+        }
+        defer rows.Close()
+        
+        for rows.Next() {
+            var p Place
+            rows.Scan(&p.ID, &p.Title, &p.Description, &p.Category, &p.Latitude,
+                &p.Longitude, &p.GoogleMapsLink, &p.CreatedAt, &p.SubmittedByUsername)
+            places = append(places, p)
+        }
+    }
+    
+    return places
 }
-
 // --- EMAIL HELPER ---
 func sendEmail(to, subject, body string) error {
     auth := smtp.PlainAuth("", smtpEmail, smtpPassword, smtpHost)
@@ -2350,35 +2428,100 @@ const allTemplates = `
         });
     }
 
-    function handleAIResponse(data) {
-        let aiHTML = '';
+   function handleAIResponse(data) {
+    let aiHTML = '';
 
-        if (data.type === 'counseling') {
-            aiHTML = escapeHTML(data.content) + ' <br><br> <a href="/counseling" class="btn-primary" style="padding: 0.5rem 1rem; text-decoration: none;">Book Appointment</a>';
-        
-        } else if (data.type === 'places') {
-            if (Array.isArray(data.content) && data.content.length > 0) {
-                aiHTML = 'Here are some places I found for you:';
-                data.content.forEach(place => {
-                    aiHTML +=
-                        '<div class="place-card" style="margin-top: 1rem; background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 10px;">' +
-                            '<h3 style="color: white;">' + escapeHTML(place.Title) + '</h3>' +
-                            '<div class="place-card-meta" style="font-size: 0.9rem;">' +
-                                'By <strong>' + escapeHTML(place.SubmittedByUsername) + '</strong> | <span>' + escapeHTML(place.Category) + '</span>' +
-                            '</div>' +
-                            '<p class="place-card-desc" style="margin-top: 0.5rem;">' + escapeHTML(place.Description) + '</p>' +
-                            '<a href="/place/' + place.ID + '" style="color: #667eea; text-decoration: none; font-weight: 600;">View Details →</a>' +
-                        '</div>';
-                });
-            } else {
-                aiHTML = escapeHTML(data.content.toString());
+    if (data.type === 'counseling') {
+        // Handle object content for counseling
+        if (typeof data.content === 'object' && data.content.message) {
+            aiHTML = escapeHTML(data.content.message);
+            
+            if (data.content.showForm) {
+                aiHTML += '<div style="margin-top: 1rem; padding: 1rem; background: rgba(255,255,255,0.05); border-radius: 10px;">';
+                aiHTML += '<h4 style="margin-bottom: 1rem;">Quick Consultation Booking</h4>';
+                aiHTML += '<form onsubmit="handleQuickConsult(event); return false;">';
+                aiHTML += '<div style="margin-bottom: 0.75rem;">';
+                aiHTML += '<input type="text" placeholder="Your Name" required style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white;">';
+                aiHTML += '</div>';
+                aiHTML += '<div style="margin-bottom: 0.75rem;">';
+                aiHTML += '<input type="email" placeholder="Your Email" required style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white;">';
+                aiHTML += '</div>';
+                aiHTML += '<div style="margin-bottom: 0.75rem;">';
+                aiHTML += '<textarea placeholder="Brief description of your needs" rows="3" required style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white;"></textarea>';
+                aiHTML += '</div>';
+                aiHTML += '<button type="submit" class="btn" style="width: 100%;">Submit Request</button>';
+                aiHTML += '</form>';
+                aiHTML += '</div>';
             }
+            aiHTML += '<br><br>Or <a href="/counseling" style="color: #667eea;">view full booking form →</a>';
+        } else {
+            aiHTML = escapeHTML(data.content);
+        }
+    
+    } else if (data.type === 'places') {
+        // Handle object content for places
+        if (typeof data.content === 'object') {
+            if (data.content.message) {
+                aiHTML = escapeHTML(data.content.message);
+            }
+            
+            if (data.content.places && Array.isArray(data.content.places) && data.content.places.length > 0) {
+                aiHTML += '<div style="margin-top: 1rem;">';
+                data.content.places.forEach(function(place) {
+                    aiHTML += '<div class="place-card" style="margin-top: 1rem; background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 10px; cursor: pointer; transition: all 0.3s;" onclick="window.location.href=\'/place/' + place.ID + '\'">';
+                    aiHTML += '<h3 style="color: #667eea; margin-bottom: 0.5rem;">' + escapeHTML(place.Title) + '</h3>';
+                    aiHTML += '<div style="font-size: 0.9rem; color: #a0a0a0; margin-bottom: 0.5rem;">';
+                    aiHTML += '<span>📍 ' + escapeHTML(place.Category) + '</span> | ';
+                    aiHTML += '<span>by ' + escapeHTML(place.SubmittedByUsername) + '</span>';
+                    aiHTML += '</div>';
+                    aiHTML += '<p style="margin-bottom: 0.75rem;">' + escapeHTML(place.Description || 'No description available') + '</p>';
+                    aiHTML += '<div style="display: flex; gap: 1rem;">';
+                    aiHTML += '<a href="/place/' + place.ID + '" style="color: #667eea; text-decoration: none;">View Details →</a>';
+                    aiHTML += '<a href="' + escapeHTML(place.GoogleMapsLink) + '" target="_blank" style="color: #667eea; text-decoration: none;" onclick="event.stopPropagation();">Google Maps →</a>';
+                    aiHTML += '</div>';
+                    aiHTML += '</div>';
+                });
+                aiHTML += '</div>';
+                aiHTML += '<br><a href="/places" style="color: #667eea;">Browse all places →</a>';
+            } else {
+                aiHTML += '<br><a href="/places" style="color: #667eea;">Browse all places →</a>';
+            }
+        } else if (Array.isArray(data.content) && data.content.length > 0) {
+            // Handle legacy array format
+            aiHTML = 'Here are some places I found for you:';
+            data.content.forEach(function(place) {
+                aiHTML += '<div class="place-card" style="margin-top: 1rem; background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 10px;">';
+                aiHTML += '<h3 style="color: white;">' + escapeHTML(place.Title) + '</h3>';
+                aiHTML += '<div class="place-card-meta" style="font-size: 0.9rem;">';
+                aiHTML += 'By <strong>' + escapeHTML(place.SubmittedByUsername) + '</strong> | <span>' + escapeHTML(place.Category) + '</span>';
+                aiHTML += '</div>';
+                aiHTML += '<p class="place-card-desc" style="margin-top: 0.5rem;">' + escapeHTML(place.Description) + '</p>';
+                aiHTML += '<a href="/place/' + place.ID + '" style="color: #667eea; text-decoration: none; font-weight: 600;">View Details →</a>';
+                aiHTML += '</div>';
+            });
         } else {
             aiHTML = escapeHTML(data.content.toString());
         }
-
-        addMessage('ai', aiHTML);
+    } else {
+        // Handle "other" type
+        if (typeof data.content === 'object' && data.content.message) {
+            aiHTML = escapeHTML(data.content.message);
+        } else {
+            aiHTML = escapeHTML(data.content.toString());
+        }
     }
+
+    addMessage('ai', aiHTML);
+}
+
+// Add this new function right after handleAIResponse
+function handleQuickConsult(event) {
+    event.preventDefault();
+    alert('Consultation request submitted! (This is a demo - implement actual submission)');
+    addMessage('user', 'I submitted a consultation request');
+    addMessage('ai', 'Thank you! Your consultation request has been received. Abel Tattersall will contact you soon at the email you provided.');
+    return false;
+}
 </script>
 {{end}}
 
