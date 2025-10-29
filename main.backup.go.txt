@@ -34,7 +34,7 @@ const (
 	baseURL = "http://localhost:8080"
 	// Gemini AI Config
 	geminiAPIKey = "AIzaSyD6NfOys90qNnnV597M_u_ePTnR1k-8r1w"
-	geminiAPIURL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+	geminiAPIURL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 )
 
 // --- GLOBALS ---
@@ -1148,21 +1148,10 @@ func searchPlaces(prompt string) []Place {
 
 // --- EMAIL HELPER ---
 func sendEmail(to, subject, body string) error {
-    auth := smtp.PlainAuth("", smtpEmail, smtpPassword, smtpHost)
-    
-    // Properly formatted email with all necessary headers
-    msg := []byte(
-        "MIME-Version: 1.0\r\n" +
-        "From: " + smtpEmail + "\r\n" +
-        "To: " + to + "\r\n" +
-        "Subject: " + subject + "\r\n" +
-        "Content-Type: text/plain; charset=\"UTF-8\"\r\n" +
-        "\r\n" +
-        body,
-    )
-    
-    addr := fmt.Sprintf("%s:%s", smtpHost, smtpPort)
-    return smtp.SendMail(addr, auth, smtpEmail, []string{to}, msg)
+	auth := smtp.PlainAuth("", smtpEmail, smtpPassword, smtpHost)
+	msg := []byte(fmt.Sprintf("To: %s\r\nSubject: %s\r\n\r\n%s", to, subject, body))
+	addr := fmt.Sprintf("%s:%s", smtpHost, smtpPort)
+	return smtp.SendMail(addr, auth, smtpEmail, []string{to}, msg)
 }
 
 // --- UTILITY FUNCTIONS ---
