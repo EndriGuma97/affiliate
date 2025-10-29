@@ -657,7 +657,14 @@ func adminPlacesHandler(w http.ResponseWriter, r *http.Request) {
 				message = "Place approved successfully with coordinates"
 			}
 		case "delete":
-			_, err := db.Exec("DELETE FROM places WHERE id = ?", placeID)
+			// Delete associated comments first (to maintain referential integrity)
+			_, err := db.Exec("DELETE FROM comments WHERE place_id = ?", placeID)
+			if err != nil {
+				log.Printf("Error deleting comments: %v", err)
+			}
+			
+			// Then delete the place
+			_, err = db.Exec("DELETE FROM places WHERE id = ?", placeID)
 			if err != nil {
 				errorMsg = "Failed to delete place"
 			} else {
@@ -686,14 +693,14 @@ func adminPlacesHandler(w http.ResponseWriter, r *http.Request) {
 	delete(session.Values, "admin_places_error")
 	session.Save(r, w)
 
-	// Get pending places
+	// Get ALL places (both pending and approved)
 	rows, err := db.Query(`
 		SELECT p.id, p.title, p.description, p.category, p.latitude, p.longitude, 
-		       p.google_maps_link, p.created_at, u.username
+		       p.google_maps_link, p.created_at, p.is_approved, u.username,
+		       (SELECT COUNT(*) FROM comments WHERE place_id = p.id) as comment_count
 		FROM places p
 		JOIN users u ON p.submitted_by_user_id = u.id
-		WHERE p.is_approved = FALSE
-		ORDER BY p.created_at DESC
+		ORDER BY p.is_approved ASC, p.created_at DESC
 	`)
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
@@ -702,20 +709,41 @@ func adminPlacesHandler(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 
 	var pendingPlaces []Place
+	var approvedPlaces []Place
+	
 	for rows.Next() {
 		var p Place
+		var isApproved bool
 		rows.Scan(&p.ID, &p.Title, &p.Description, &p.Category, &p.Latitude, 
-			&p.Longitude, &p.GoogleMapsLink, &p.CreatedAt, &p.SubmittedByUsername)
-		pendingPlaces = append(pendingPlaces, p)
+			&p.Longitude, &p.GoogleMapsLink, &p.CreatedAt, &isApproved, 
+			&p.SubmittedByUsername, &p.CommentCount)
+		
+		p.IsApproved = isApproved
+		
+		if isApproved {
+			approvedPlaces = append(approvedPlaces, p)
+		} else {
+			pendingPlaces = append(pendingPlaces, p)
+		}
+	}
+
+	// Pass both pending and approved places to the template
+	type ExtendedAdminPlacesPageData struct {
+		CurrentUser     User
+		PendingPlaces   []Place
+		ApprovedPlaces  []Place
+		Message         string
+		Error           string
 	}
 
 	renderTemplate(w, "admin_places", PageBundle{
 		PageName: "admin_places",
-		Data: AdminPlacesPageData{
-			CurrentUser:   user,
-			PendingPlaces: pendingPlaces,
-			Message:       message,
-			Error:         errorMsg,
+		Data: ExtendedAdminPlacesPageData{
+			CurrentUser:     user,
+			PendingPlaces:   pendingPlaces,
+			ApprovedPlaces:  approvedPlaces,
+			Message:         message,
+			Error:           errorMsg,
 		},
 		CurrentUser: user,
 	})
@@ -1990,9 +2018,9 @@ const allTemplates = `
 {{template "layout" .}}
 <div class="container">
     <div class="dashboard-card">
-        <h1>Manage Pending Places</h1>
+        <h1>Manage Places</h1>
         <p style="color: var(--text-gray); margin-bottom: 2rem;">
-            Approve or delete new community submissions.
+            Approve pending submissions and manage all places.
         </p>
         <a href="/admin/" class="btn-secondary" style="padding: 0.8rem 1.5rem; text-decoration: none; display: inline-block; margin-bottom: 2rem;">← Back to Main Admin</a>
         
@@ -2003,19 +2031,21 @@ const allTemplates = `
             <div class="alert-success" style="margin-top: 1.5rem;">{{.Data.Message}}</div>
         {{end}}
         
+        <!-- Pending Places Section -->
         <h2 style="margin-top: 2rem; margin-bottom: 1.5rem; color: var(--text-light);">
-            {{len .Data.PendingPlaces}} Places Awaiting Review
+            📋 Pending Review ({{len .Data.PendingPlaces}})
         </h2>
         
-        <div class="admin-table">
+        {{if .Data.PendingPlaces}}
+        <div class="admin-table" style="margin-bottom: 3rem;">
             <table>
                 <thead>
                     <tr>
                         <th>Title</th>
                         <th>Submitted By</th>
                         <th>Category</th>
-                        <th>Google Maps Link</th>
-                        <th>Coordinates</th>
+                        <th>Google Maps</th>
+                        <th>Set Coordinates</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
@@ -2029,7 +2059,7 @@ const allTemplates = `
                         <td>{{.SubmittedByUsername}}</td>
                         <td>{{.Category}}</td>
                         <td>
-                            <a href="{{.GoogleMapsLink}}" target="_blank" style="color: #667eea;">View Link</a>
+                            <a href="{{.GoogleMapsLink}}" target="_blank" style="color: #667eea;">View</a>
                         </td>
                         <td>
                             <form action="/admin/places" method="POST" class="action-form">
@@ -2049,14 +2079,66 @@ const allTemplates = `
                         </td>
                     </tr>
                     {{end}}
-                    {{if not .Data.PendingPlaces}}
+                </tbody>
+            </table>
+        </div>
+        {{else}}
+        <p style="color: var(--text-gray); margin-bottom: 3rem;">No pending submissions.</p>
+        {{end}}
+
+        <!-- Approved Places Section -->
+        <h2 style="margin-top: 2rem; margin-bottom: 1.5rem; color: var(--text-light);">
+            ✅ Approved Places ({{len .Data.ApprovedPlaces}})
+        </h2>
+        
+        {{if .Data.ApprovedPlaces}}
+        <div class="admin-table">
+            <table>
+                <thead>
                     <tr>
-                        <td colspan="6" style="text-align: center; color: var(--text-gray);">No pending submissions.</td>
+                        <th>Title</th>
+                        <th>Submitted By</th>
+                        <th>Category</th>
+                        <th>Coordinates</th>
+                        <th>Comments</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range .Data.ApprovedPlaces}}
+                    <tr>
+                        <td>
+                            <strong>{{.Title}}</strong>
+                            <p style="font-size: 0.9rem; color: var(--text-gray);">{{.Description}}</p>
+                        </td>
+                        <td>{{.SubmittedByUsername}}</td>
+                        <td>{{.Category}}</td>
+                        <td>
+                            {{if ne .Latitude 0.0}}
+                                <span style="font-family: monospace; font-size: 0.85rem;">{{.Latitude}}, {{.Longitude}}</span>
+                            {{else}}
+                                <span style="color: var(--text-gray);">Not set</span>
+                            {{end}}
+                        </td>
+                        <td>{{.CommentCount}}</td>
+                        <td>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <a href="/place/{{.ID}}" target="_blank" class="btn-admin" style="text-decoration: none; display: inline-block;">View</a>
+                                <form action="/admin/places" method="POST" class="action-form" onsubmit="return confirm('⚠️ WARNING: This will permanently delete this place and all {{.CommentCount}} comment(s). Are you sure?');">
+                                    <input type="hidden" name="place_id" value="{{.ID}}">
+                                    <input type="hidden" name="action" value="delete">
+                                    <button type="submit" class="btn-delete">Delete</button>
+                                </form>
+                            </div>
+                        </td>
                     </tr>
                     {{end}}
                 </tbody>
             </table>
         </div>
+        {{else}}
+        <p style="color: var(--text-gray);">No approved places yet.</p>
+        {{end}}
     </div>
 </div>
 {{end}}
