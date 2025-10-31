@@ -1,655 +1,1136 @@
-# Chapter 7: Authentication and Sessions
+# Chapter 7: Authentication and Sessions 🔐
 
-## Introduction
+## Welcome to Security!
 
-Authentication is how your app knows "who you are" (login), and sessions are how it "remembers" you across multiple page loads. This chapter covers the complete authentication flow in your application.
-
----
-
-## The Authentication Flow
-
-```
-1. User registers (creates account)
-    ↓
-2. Email verification sent
-    ↓
-3. User clicks verification link
-    ↓
-4. Account marked as verified
-    ↓
-5. User logs in (username + password)
-    ↓
-6. Password verified with bcrypt
-    ↓
-7. Session created (cookie sent to browser)
-    ↓
-8. User makes requests (cookie included automatically)
-    ↓
-9. Server reads cookie → Knows who user is
-    ↓
-10. User logs out → Cookie deleted
-```
+Authentication is HOW your app knows who you are. Sessions are HOW it remembers you across page visits. This chapter covers the security foundation of your app!
 
 ---
 
-## Section 1: Password Hashing with Bcrypt
+## 📍 The Big Picture
 
-### Why NOT Store Plain Passwords?
+**Authentication = Proving who you are**
+- Username + Password
+- Email verification
+- Password reset
 
-**❌ If database is breached:**
+**Session = Remembering who you are**
+- After login, server creates encrypted cookie
+- Browser sends cookie with every request
+- Server reads cookie to know you're still logged in
+
+**Security = Keeping everything safe**
+- bcrypt password hashing (uncrackable)
+- Secure session cookies (encrypted)
+- HTTPS-only communication (SSL/TLS)
+
+---
+
+## 🔑 Password Hashing with bcrypt
+
+### Why We NEVER Store Plain Passwords
+
+**❌ TERRIBLE - Plain text passwords:**
 ```
-users table:
-id | username | password
-1  | john     | password123   ← Everyone can see it!
-2  | jane     | qwerty
+Database:
+- alice: password123
+- bob:   mydog2024
+- carol: qwerty
+
+Hacker steals database:
+→ Game over! All passwords exposed!
+→ Users who reuse passwords compromised everywhere!
 ```
 
-**✅ With hashing:**
+**✅ GOOD - Hashed passwords:**
 ```
-users table:
-id | username | password_hash
-1  | john     | $2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl...  ← Impossible to reverse!
-2  | jane     | $2a$10$3fE2jLm9X...
+Database:
+- alice: $2a$10$N9qo8uLOickgx2ZMRZoMyeIj...
+- bob:   $2a$10$7hFn3XJ9mRkKNGf8g2jN4eOp...
+- carol: $2a$10$M8no9kLPRqS5tGh4nH2jK9Ql...
+
+Hacker steals database:
+→ Can't reverse the hashes!
+→ Would take millions of years to crack!
 ```
 
-### Hashing on Registration (Line 405)
+### How bcrypt Works
 
+**Hashing (Registration) - Line 428:**
 ```go
-hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-if err != nil {
-    // Handle error
-}
-
-// Store hash in database
-db.Exec("INSERT INTO users (..., password_hash) VALUES (..., ?)", ..., string(hashedPassword))
+hashedPassword, err := bcrypt.GenerateFromPassword(
+	[]byte(password),
+	bcrypt.DefaultCost,
+)
+// "password123" → "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
 ```
 
 **What happens:**
 ```
-User enters: "mypassword123"
-    ↓
-bcrypt.GenerateFromPassword()
-    ↓
-Generates: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+1. Take password: "password123"
+2. Generate random salt (makes each hash unique)
+3. Run bcrypt algorithm (intentionally slow!)
+4. Get hash: "$2a$10$N9qo..."
 ```
 
-**Key properties:**
-- **One-way:** Can't reverse the hash to get password
-- **Unique:** Same password generates different hashes each time (salting)
-- **Slow:** Takes ~100ms to generate (prevents brute force)
-
-**Example:**
+**Verification (Login) - Line 501:**
 ```go
-bcrypt.GenerateFromPassword([]byte("password"), bcrypt.DefaultCost)
-// First run:  $2a$10$abc123...
-// Second run: $2a$10$xyz789...  ← Different hash!
-```
-
-### Verifying on Login (Line 470)
-
-```go
-var user User
-// Fetch user from database (gets password_hash)
-db.QueryRow("SELECT ..., password_hash FROM users WHERE username = ?", username).Scan(..., &user.PasswordHash)
-
-// Compare submitted password with stored hash
-err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password))
-if err != nil {
-    // Wrong password!
-} else {
-    // Correct password!
-}
-```
-
-**How it works:**
-```
-User enters: "mypassword123"
-    ↓
-bcrypt.CompareHashAndPassword(
-    storedHash: "$2a$10$N9qo...",  ← From database
-    password:   "mypassword123"     ← User input
+err := bcrypt.CompareHashAndPassword(
+	[]byte(user.PasswordHash),  // From database
+	[]byte(password),            // User typed this
 )
-    ↓
-Returns: nil (passwords match) or error (passwords don't match)
+
+if err != nil {
+	// Wrong password!
+} else {
+	// Correct password!
+}
 ```
+
+**What happens:**
+```
+1. User types password: "password123"
+2. bcrypt hashes it with same salt
+3. Compares hashes:
+   - Database: $2a$10$N9qo8uLO...
+   - Generated: $2a$10$N9qo8uLO...
+   - Match? → Login successful!
+```
+
+### Anatomy of a bcrypt Hash
+
+```
+$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
+ │   │  │                         │
+ │   │  └─ Random salt ──────────────────────────────────────┘
+ │   └──── Cost (difficulty) = 10
+ └──────── Algorithm version = 2a
+```
+
+**Cost = how many rounds:**
+```
+Cost 10 = 2^10 = 1,024 rounds   (~100ms)
+Cost 12 = 2^12 = 4,096 rounds   (~400ms)
+Cost 14 = 2^14 = 16,384 rounds  (~1.6 seconds)
+```
+
+**Why slow is good:**
+- For normal login: 100ms is fine (user doesn't notice)
+- For attacker: Trying 1 million passwords = 1,000,000 × 100ms = 27 hours per million!
+
+**bcrypt.DefaultCost = 10** (good balance)
+
+### bcrypt Security Features
+
+**1. Salted automatically:**
+```go
+bcrypt.GenerateFromPassword([]byte("password123"), 10)
+// First time:  $2a$10$abc...
+// Second time: $2a$10$xyz...  ← Different hash! Same password!
+```
+
+Each hash has unique salt = can't use rainbow tables!
+
+**2. Adaptive difficulty:**
+```go
+// Today: Cost 10 is good
+bcrypt.GenerateFromPassword(pwd, 10)
+
+// Future: Computers faster? Just increase cost!
+bcrypt.GenerateFromPassword(pwd, 12)  // Still works!
+```
+
+**3. Designed to be slow:**
+- Fast algorithms (MD5, SHA1) = bad for passwords
+- bcrypt intentionally slow = makes brute force impractical
 
 ---
 
-## Section 2: Email Verification Flow
+## 🍪 Session Management with Gorilla Sessions
 
-### Why Verify Emails?
+### What is a Session?
 
-1. **Confirm real email** - User didn't typo
-2. **Prevent spam** - Bots can't verify emails
-3. **Enable password reset** - Know email works
+**Problem:** HTTP is **stateless** (each request is independent)
 
-### Generating Verification Tokens (Lines 417-418)
+```
+User logs in on Request 1
+   ↓
+Request 2: Server has no idea who you are!
+Request 3: Still no idea!
+Request 4: Still no idea!
+```
+
+**Solution:** Sessions!
+
+```
+User logs in
+   ↓
+Server creates session, sends encrypted cookie
+   ↓
+Browser stores cookie
+   ↓
+Every request includes cookie
+   ↓
+Server reads cookie: "Oh, this is user 42!"
+```
+
+### Session Setup (Lines 207-215)
 
 ```go
-token := generateToken()  // Random 64-character hex string
-expiry := time.Now().Add(24 * time.Hour)  // Valid for 24 hours
-```
-
-**generateToken() function (Lines 1158-1162):**
-```go
-func generateToken() string {
-    b := make([]byte, 32)  // 32 bytes
-    rand.Read(b)           // Fill with cryptographically secure random bytes
-    return hex.EncodeToString(b)  // Convert to hex: 64 characters
-}
-```
-
-**Example tokens:**
-```
-a7f3b82c1e4d5f6a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c
-f8e9d0c1b2a3948576a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0
-```
-
-**Why cryptographically secure?**
-```go
-// ❌ Predictable (DON'T USE)
-token := fmt.Sprintf("%d", time.Now().Unix())  // "1640000000"
-
-// ✅ Unpredictable (USE THIS)
-crypto/rand.Read()  // Truly random
-```
-
-### Sending Verification Email (Lines 436-441)
-
-```go
-verificationLink := fmt.Sprintf("%s/verify?token=%s", baseURL, token)
-// Result: "http://localhost:8080/verify?token=a7f3b82c..."
-
-emailBody := fmt.Sprintf("Welcome %s!\n\nClick here to verify your email: %s\n\nThis link expires in 24 hours.",
-    username, verificationLink)
-
-if err := sendEmail(email, "Verify Your Email", emailBody); err != nil {
-    log.Printf("Failed to send verification email: %v", err)
-}
-```
-
-**Email looks like:**
-```
-To: user@example.com
-Subject: Verify Your Email
-
-Welcome john_doe!
-
-Click here to verify your email: http://localhost:8080/verify?token=a7f3b82c...
-
-This link expires in 24 hours.
-```
-
-### Verifying Email (Lines 495-537)
-
-```go
-func verifyHandler(w http.ResponseWriter, r *http.Request) {
-    token := r.URL.Query().Get("token")  // Get token from URL
-    if token == "" {
-        // No token provided
-        return
-    }
-
-    // Update user with matching token
-    result, err := db.Exec(
-        "UPDATE users SET is_verified = TRUE, verification_token = NULL WHERE verification_token = ? AND token_expiry > ?",
-        token, time.Now(),
-    )
-
-    // Check if a row was updated
-    rowsAffected, _ := result.RowsAffected()
-    if rowsAffected == 0 {
-        // Token invalid or expired
-    } else {
-        // Success!
-    }
-}
-```
-
-**SQL conditions:**
-```sql
-WHERE verification_token = ?     -- Token must match
-AND token_expiry > ?             -- Must not be expired
-```
-
-**Outcomes:**
-```
-Token correct + Not expired → rowsAffected = 1 → Success
-Token wrong → rowsAffected = 0 → Error
-Token expired → rowsAffected = 0 → Error
-Token already used (NULL) → rowsAffected = 0 → Error
-```
-
----
-
-## Section 3: Sessions (Staying Logged In)
-
-### How Sessions Work
-
-```
-1. User logs in successfully
-    ↓
-2. Server creates session ID: "abc123xyz"
-    ↓
-3. Server stores: sessions["abc123xyz"] = {user_id: 42}
-    ↓
-4. Server sends cookie to browser:
-   Set-Cookie: session=abc123xyz; HttpOnly; Secure
-    ↓
-5. Browser stores cookie
-    ↓
-6. Every request includes cookie automatically
-    ↓
-7. Server reads cookie: "abc123xyz"
-    ↓
-8. Server looks up: sessions["abc123xyz"] → {user_id: 42}
-    ↓
-9. Server knows: "This is user 42"
-```
-
-### Initializing Sessions (Lines 198-203)
-
-```go
+// Create session store
 store = sessions.NewCookieStore([]byte(sessionKey))
+
+// Configure security options
 store.Options = &sessions.Options{
-    Path:     "/",          // Cookie valid for all pages
-    MaxAge:   86400 * 7,    // 7 days in seconds
-    HttpOnly: true,         // JavaScript cannot access (security)
+	Path:     "/",
+	MaxAge:   86400 * 7, // 7 days in seconds
+	HttpOnly: true,      // Can't be accessed by JavaScript
+	Secure:   true,      // Only send over HTTPS
 }
 ```
 
-**sessionKey** (line 32):
+**Options explained:**
+
+| Option | Value | What it means |
+|--------|-------|---------------|
+| `Path` | `"/"` | Cookie valid for entire site |
+| `MaxAge` | `86400 * 7` | Cookie expires after 7 days |
+| `HttpOnly` | `true` | JavaScript can't access (prevents XSS theft) |
+| `Secure` | `true` | Only sent over HTTPS (prevents interception) |
+
+**🤔 What's the sessionKey?**
+
 ```go
 const sessionKey = "a-very-secret-key-32-bytes-long"
 ```
 
-**Why secret?**
-- Cookies are encrypted with this key
-- Without the key, attacker can't forge cookies
-- ⚠️ Should be environment variable in production!
+Used to **encrypt** and **sign** cookies:
+- Encryption: Cookie contents are unreadable
+- Signing: Tampering is detectable
 
-**MaxAge: 86400 * 7 seconds = 7 days**
-```go
-User logs in → Cookie expires in 7 days
-User logs in again → Cookie refreshed for another 7 days
-```
+**🚨 Security note:** Keep this key secret! Anyone with the key can create fake sessions!
 
-**HttpOnly: true**
-```javascript
-// JavaScript CANNOT do this:
-document.cookie  // Won't see session cookie
-
-// Prevents XSS attacks:
-<script>
-    // Attacker's script can't steal cookie!
-</script>
-```
-
-### Creating a Session (Lines 481-485)
+### Creating a Session (Login) - Lines 507-510
 
 ```go
-// User just logged in successfully
+// After successful password verification
 session, _ := store.Get(r, "session")
-session.Values["user_id"] = user.ID  // Store user ID in session
-session.Save(r, w)                    // Send cookie to browser
-
-http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+session.Values["user_id"] = user.ID  // Store user ID
+session.Save(r, w)  // Send cookie to browser
 ```
 
 **What happens:**
 ```
-Browser                          Server
-   │                                │
-   │─── POST /login ────────────────→│ (username, password)
-   │                                │
-   │                            Verify password ✓
-   │                            Create session
-   │                            session["user_id"] = 42
-   │                                │
-   │←── Set-Cookie: session=abc... ─│
-   │    Redirect to /dashboard      │
-   │                                │
+1. Create/get session
+2. Store user_id in it
+3. Encrypt and sign the session data
+4. Send as cookie:
+   Set-Cookie: session=MTUwOTI3NzQ5N... HttpOnly; Secure
+5. Browser stores it
 ```
 
-**Browser now has:**
+**Cookie example:**
 ```
-Cookies:
-  session=abc123xyz; expires=Fri, 22-Jan-2024; HttpOnly
+Name: session
+Value: MTUwOTI3NzQ5NnxEdi1CQkFFQ180SUFBUkFCRUFBQU12LUNBQUVHYzNSeWFXNW5EQThBRFdGM...
+Options: HttpOnly, Secure, Max-Age=604800
 ```
 
-### Reading a Session (Lines 331-345)
+### Reading a Session - Lines 355-363
 
 ```go
 func getCurrentUser(r *http.Request) (User, error) {
-    session, _ := store.Get(r, "session")
-    userID, ok := session.Values["user_id"].(int)
-    if !ok || userID == 0 {
-        return User{}, fmt.Errorf("no valid session")
-    }
+	session, _ := store.Get(r, "session")
+	userID, ok := session.Values["user_id"].(int)
 
-    var user User
-    err := db.QueryRow(
-        "SELECT id, username, email, is_verified, is_admin FROM users WHERE id = ?",
-        userID,
-    ).Scan(&user.ID, &user.Username, &user.Email, &user.IsVerified, &user.IsAdmin)
+	if !ok || userID == 0 {
+		return User{}, fmt.Errorf("no valid session")
+	}
 
-    return user, err
+	// Query database for user details
+	var user User
+	err := db.QueryRow(
+		"SELECT id, username, email, is_verified, is_admin FROM users WHERE id = ?",
+		userID,
+	).Scan(&user.ID, &user.Username, &user.Email, &user.IsVerified, &user.IsAdmin)
+
+	return user, err
 }
 ```
 
 **Flow:**
 ```
-1. Get session from cookie
-2. Extract user_id from session
-3. Query database for user details
-4. Return full User struct
+1. Browser sends cookie with request
+2. store.Get() decrypts and verifies cookie
+3. Extract user_id from session
+4. Look up full user details in database
+5. Return User struct
 ```
 
-**Every protected page calls this!**
+**Why not store everything in session?**
+```go
+// ❌ Bad - storing too much
+session.Values["user_id"] = user.ID
+session.Values["username"] = user.Username
+session.Values["email"] = user.Email
+session.Values["is_verified"] = user.IsVerified
+session.Values["is_admin"] = user.IsAdmin
+// Cookie becomes huge! And data can become stale.
 
-### Destroying a Session (Logout) (Lines 488-493)
+// ✅ Good - only store ID
+session.Values["user_id"] = user.ID
+// Then query database for fresh data when needed
+```
+
+### Destroying a Session (Logout) - Lines 515-520
 
 ```go
 func logoutHandler(w http.ResponseWriter, r *http.Request) {
-    session, _ := store.Get(r, "session")
-    delete(session.Values, "user_id")  // Remove user_id from session
-    session.Save(r, w)                  // Save changes (sends updated cookie)
-    http.Redirect(w, r, "/", http.StatusSeeOther)
+	session, _ := store.Get(r, "session")
+	delete(session.Values, "user_id")  // Remove user_id
+	session.Save(r, w)  // Update cookie
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 ```
 
 **What happens:**
 ```
-Before: session.Values = {"user_id": 42}
-After:  session.Values = {}  (empty)
+1. Get session
+2. Delete user_id key
+3. Save (sends updated cookie)
+4. Browser now has empty session
+5. getCurrentUser() will return error (no user_id)
+6. User is logged out!
 ```
-
-**Browser's cookie is updated to empty session.**
 
 ---
 
-## Section 4: Protecting Routes
+## ✉️ Email Verification Flow
 
-### The requireAuth Middleware (Lines 347-367)
+### Why Email Verification?
+
+**Prevents:**
+- Fake accounts (spam bots)
+- Typos in email address
+- Someone registering with your email
+
+**Ensures:**
+- User owns the email address
+- Can contact user if needed
+- Better quality user base
+
+### The Complete Flow
+
+```
+1. User registers
+   ↓
+2. Hash password, generate token
+   ↓
+3. Save user with is_verified = FALSE
+   ↓
+4. Send email with verification link
+   ↓
+5. User clicks link
+   ↓
+6. Verify token, set is_verified = TRUE
+   ↓
+7. User can now fully use the app
+```
+
+### Step 1: Generate Token (Lines 440-442)
+
+```go
+token := generateToken()
+expiry := time.Now().Add(24 * time.Hour)  // Valid for 24 hours
+```
+
+**generateToken() function (Lines 1217-1221):**
+```go
+func generateToken() string {
+	b := make([]byte, 32)  // 32 bytes = 256 bits
+	rand.Read(b)  // Fill with cryptographically secure random data
+	return hex.EncodeToString(b)  // Convert to hex string
+}
+```
+
+**Example token:**
+```
+a7f3b82c4d9e1f6a8b2c5e7d9f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d5f7a
+```
+
+**Why 32 bytes?**
+- 2^256 possible values
+- Impossible to guess even with billions of attempts
+
+### Step 2: Store Token in Database (Lines 445-447)
+
+```go
+_, err = db.Exec(
+	"INSERT INTO users (username, email, password_hash, verification_token, token_expiry) VALUES (?, ?, ?, ?, ?)",
+	username, email, string(hashedPassword), token, expiry,
+)
+```
+
+**Database row:**
+```
+id: 42
+username: john_doe
+email: john@example.com
+password_hash: $2a$10$N9qo...
+is_verified: FALSE  ← Not verified yet!
+verification_token: a7f3b82c...
+token_expiry: 2024-01-16 10:30:00
+```
+
+### Step 3: Send Verification Email (Lines 459-463)
+
+```go
+verificationLink := fmt.Sprintf("%s/verify?token=%s", baseURL, token)
+emailBody := fmt.Sprintf("Welcome %s!\n\nClick here to verify your email: %s\n\nThis link expires in 24 hours.",
+	username, verificationLink)
+
+if err := sendEmail(email, "Verify Your Email", emailBody); err != nil {
+	log.Printf("Failed to send verification email: %v", err)
+}
+```
+
+**Email content:**
+```
+To: john@example.com
+Subject: Verify Your Email
+
+Welcome john_doe!
+
+Click here to verify your email:
+https://explorer.needgreatersglobal.com/verify?token=a7f3b82c...
+
+This link expires in 24 hours.
+```
+
+### Step 4: User Clicks Link
+
+```
+Browser visits:
+https://explorer.needgreatersglobal.com/verify?token=a7f3b82c...
+   ↓
+Routed to: verifyHandler
+```
+
+### Step 5: Verify Token (Lines 522-561)
+
+```go
+func verifyHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract token from URL
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		// No token provided
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Invalid Token",
+				Message: "Verification token is missing.",
+			},
+		})
+		return
+	}
+
+	// Update user (if token valid and not expired)
+	result, err := db.Exec(
+		`UPDATE users
+		 SET is_verified = TRUE, verification_token = NULL
+		 WHERE verification_token = ? AND token_expiry > ?`,
+		token, time.Now(),
+	)
+
+	if err != nil {
+		// Database error
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Verification Failed",
+				Message: "An error occurred during verification.",
+			},
+		})
+		return
+	}
+
+	// Check if any rows were updated
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// No user found with this token, or token expired
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Invalid or Expired Token",
+				Message: "The verification link is invalid or has expired.",
+			},
+		})
+		return
+	}
+
+	// Success!
+	renderTemplate(w, "message", PageBundle{
+		Data: MessagePageData{
+			Title:   "Email Verified",
+			Message: "Your email has been successfully verified. You can now log in.",
+		},
+	})
+}
+```
+
+**What this query does:**
+```sql
+UPDATE users
+SET is_verified = TRUE, verification_token = NULL
+WHERE verification_token = ? AND token_expiry > ?
+```
+
+**Conditions:**
+1. Token matches database
+2. Token not expired (`token_expiry > NOW()`)
+
+**If both true:**
+- Set `is_verified = TRUE`
+- Clear token (`NULL`)
+- Return success
+
+**If either false:**
+- No rows updated
+- Return error
+
+### Security Features
+
+✅ **Token is random** - Can't be guessed
+✅ **Token expires** - Can't be used after 24 hours
+✅ **Token cleared after use** - Can't verify twice
+✅ **Token in URL, not cookie** - Works even if not logged in
+
+---
+
+## 🔐 Password Reset Flow
+
+**Similar to email verification, but for resetting forgotten passwords.**
+
+### The Complete Flow
+
+```
+1. User forgot password, visits /forgot-password
+   ↓
+2. Enters email address
+   ↓
+3. Generate reset token, store in DB
+   ↓
+4. Send email with reset link
+   ↓
+5. User clicks link
+   ↓
+6. Show reset form
+   ↓
+7. User enters new password
+   ↓
+8. Update password, clear token
+   ↓
+9. User can log in with new password!
+```
+
+### Step 1: Request Reset (Lines 567-624)
+
+```go
+func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		// Show forgot password form
+		return
+	}
+
+	// Handle POST
+	email := r.FormValue("email")
+
+	var userID int
+	var username string
+	err := db.QueryRow("SELECT id, username FROM users WHERE email = ?", email).Scan(&userID, &username)
+
+	if err != nil {
+		// 🚨 IMPORTANT: Don't reveal if email exists!
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Password Reset Email Sent",
+				Message: "If an account exists with this email, a password reset link has been sent.",
+			},
+		})
+		return
+	}
+
+	// Generate reset token (shorter expiry than email verification)
+	token := generateToken()
+	expiry := time.Now().Add(1 * time.Hour)  // 1 hour
+
+	// Store token
+	_, err = db.Exec(
+		"UPDATE users SET password_reset_token = ?, reset_token_expiry = ? WHERE id = ?",
+		token, expiry, userID,
+	)
+
+	// Send reset email
+	resetLink := fmt.Sprintf("%s/reset-password?token=%s", baseURL, token)
+	emailBody := fmt.Sprintf(`Hello %s,
+
+You requested a password reset. Click the link below to reset your password:
+
+%s
+
+This link expires in 1 hour.
+
+If you didn't request this, please ignore this email.`, username, resetLink)
+
+	sendEmail(email, "Password Reset Request", emailBody)
+
+	// Always show same message (security)
+	renderTemplate(w, "message", PageBundle{
+		Data: MessagePageData{
+			Title:   "Password Reset Email Sent",
+			Message: "If an account exists with this email, a password reset link has been sent.",
+		},
+	})
+}
+```
+
+**🚨 Security principle: Information disclosure**
+
+```go
+// ❌ BAD - reveals if email exists
+if err != nil {
+	return "Email not found"
+} else {
+	return "Reset link sent to email"
+}
+
+// Attacker can discover which emails are registered!
+
+// ✅ GOOD - same message always
+"If an account exists with this email, a password reset link has been sent."
+
+// Attacker can't tell if email exists or not
+```
+
+### Step 2: Verify Token and Show Form (Lines 630-663)
+
+```go
+func resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+
+	if r.Method == http.MethodGet {
+		// Check if token is valid
+		var count int
+		err := db.QueryRow(
+			"SELECT COUNT(*) FROM users WHERE password_reset_token = ? AND reset_token_expiry > ?",
+			token, time.Now(),
+		).Scan(&count)
+
+		if err != nil || count == 0 {
+			// Token invalid or expired
+			renderTemplate(w, "message", PageBundle{
+				Data: MessagePageData{
+					Title:   "Invalid Reset Link",
+					Message: "This password reset link is invalid or has expired.",
+				},
+			})
+			return
+		}
+
+		// Token valid, show reset form
+		renderTemplate(w, "reset_password", PageBundle{
+			Data: map[string]string{
+				"token": token,  // Pass token to form
+			},
+		})
+		return
+	}
+
+	// Handle POST (continue to step 3...)
+}
+```
+
+**Form includes hidden token field:**
+```html
+<form method="POST" action="/reset-password">
+	<input type="hidden" name="token" value="a7f3b82c...">
+	<input type="password" name="password" placeholder="New Password">
+	<input type="password" name="confirm_password" placeholder="Confirm Password">
+	<button type="submit">Reset Password</button>
+</form>
+```
+
+### Step 3: Process Reset (Lines 664-717)
+
+```go
+	// Handle POST
+	newPassword := r.FormValue("password")
+	confirmPassword := r.FormValue("confirm_password")
+
+	// Verify passwords match
+	if newPassword != confirmPassword {
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Password Mismatch",
+				Message: "Passwords do not match.",
+			},
+		})
+		return
+	}
+
+	// Hash new password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		// Failed to hash
+		return
+	}
+
+	// Update password and clear reset token
+	result, err := db.Exec(
+		`UPDATE users
+		 SET password_hash = ?, password_reset_token = NULL, reset_token_expiry = NULL
+		 WHERE password_reset_token = ? AND reset_token_expiry > ?`,
+		string(hashedPassword), token, time.Now(),
+	)
+
+	if err != nil {
+		// Database error
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// Token invalid or expired
+		renderTemplate(w, "message", PageBundle{
+			Data: MessagePageData{
+				Title:   "Invalid Reset Link",
+				Message: "This password reset link is invalid or has expired.",
+			},
+		})
+		return
+	}
+
+	// Success!
+	renderTemplate(w, "message", PageBundle{
+		Data: MessagePageData{
+			Title:   "Password Reset Successful",
+			Message: "Your password has been reset successfully. You can now log in with your new password.",
+		},
+	})
+}
+```
+
+**SQL does everything atomically:**
+```sql
+UPDATE users
+SET password_hash = ?, password_reset_token = NULL, reset_token_expiry = NULL
+WHERE password_reset_token = ? AND reset_token_expiry > ?
+```
+
+**Conditions:**
+1. Token matches
+2. Token not expired
+
+**If both true:**
+- Update password
+- Clear reset token
+- Return success
+
+**If either false:**
+- No rows updated
+- Token already used or expired
+
+---
+
+## 🛡️ Middleware Protection
+
+### requireAuth Middleware (Lines 370-390)
+
+**Purpose:** Ensure user is logged in and email verified
 
 ```go
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
-        user, err := getCurrentUser(r)
-        if err != nil {
-            // Not logged in
-            http.Redirect(w, r, "/login", http.StatusSeeOther)
-            return
-        }
-        if !user.IsVerified {
-            // Email not verified
-            renderTemplate(w, "message", PageBundle{
-                Data: MessagePageData{
-                    Title:   "Email Not Verified",
-                    Message: "Please verify your email address to access this page.",
-                },
-            })
-            return
-        }
-        // Store user in context for the handler
-        ctx := context.WithValue(r.Context(), "user", user)
-        next(w, r.WithContext(ctx))
-    }
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Try to get current user
+		user, err := getCurrentUser(r)
+		if err != nil {
+			// Not logged in
+			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+
+		// Check if email verified
+		if !user.IsVerified {
+			renderTemplate(w, "message", PageBundle{
+				Data: MessagePageData{
+					Title:   "Email Not Verified",
+					Message: "Please verify your email address to access this page.",
+				},
+			})
+			return
+		}
+
+		// User is logged in and verified!
+		// Put user in context for handler to access
+		ctx := context.WithValue(r.Context(), "user", user)
+		next(w, r.WithContext(ctx))
+	}
 }
+```
+
+**Visual flow:**
+```
+Request to /dashboard
+   ↓
+requireAuth middleware
+   ↓
+Is user logged in?
+   ├─ NO → Redirect to /login
+   └─ YES → Is email verified?
+             ├─ NO → Show "verify email" message
+             └─ YES → Call dashboardHandler
 ```
 
 **Usage:**
 ```go
 mux.HandleFunc("/dashboard", requireAuth(dashboardHandler))
+mux.HandleFunc("/change-password", requireAuth(changePasswordHandler))
+mux.HandleFunc("/delete-account", requireAuth(deleteAccountHandler))
 mux.HandleFunc("/api/comment", requireAuth(commentHandler))
 ```
 
-**Flow:**
-```
-User visits /dashboard
-    ↓
-requireAuth checks session
-    ↓
-If not logged in → Redirect to /login
-If not verified → Show "verify email" message
-If authenticated → Call dashboardHandler
-```
+### requireAdmin Middleware (Lines 392-403)
 
-**Passing user to handler:**
-```go
-ctx := context.WithValue(r.Context(), "user", user)
-next(w, r.WithContext(ctx))
-```
-
-**Handler receives user:**
-```go
-func dashboardHandler(w http.ResponseWriter, r *http.Request) {
-    user := r.Context().Value("user").(User)  // Get user from context
-    // Use user...
-}
-```
-
-### The requireAdmin Middleware (Lines 369-379)
+**Purpose:** Ensure user is admin
 
 ```go
 func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
-    return func(w http.ResponseWriter, r *http.Request) {
-        user, err := getCurrentUser(r)
-        if err != nil || !user.IsAdmin {
-            http.Error(w, "Unauthorized", http.StatusUnauthorized)
-            return
-        }
-        ctx := context.WithValue(r.Context(), "user", user)
-        next(w, r.WithContext(ctx))
-    }
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, err := getCurrentUser(r)
+		if err != nil || !user.IsAdmin {
+			// Not logged in OR not admin
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		// User is admin!
+		ctx := context.WithValue(r.Context(), "user", user)
+		next(w, r.WithContext(ctx))
+	}
 }
 ```
 
-**Checks:**
-1. User is logged in
-2. User has admin flag
+**Double check:**
+1. Must be logged in (getCurrentUser succeeds)
+2. Must be admin (`user.IsAdmin == true`)
 
 **Usage:**
 ```go
 mux.HandleFunc("/admin/", requireAdmin(adminHandler))
+mux.HandleFunc("/admin/places", requireAdmin(adminPlacesHandler))
 ```
 
 ---
 
-## Section 5: Security Considerations
+## 🔒 Security Best Practices in Your Code
 
-### ✅ What Your Code Does Well
+### 1. Password Security ✅
 
-1. **Passwords hashed with bcrypt**
-   ```go
-   bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-   ```
-
-2. **Cryptographically secure tokens**
-   ```go
-   crypto/rand.Read(b)  // Not predictable
-   ```
-
-3. **Token expiration**
-   ```go
-   expiry := time.Now().Add(24 * time.Hour)
-   ```
-
-4. **HttpOnly cookies**
-   ```go
-   HttpOnly: true  // JavaScript can't access
-   ```
-
-5. **Checks both authentication AND verification**
-   ```go
-   if err != nil { /* not logged in */ }
-   if !user.IsVerified { /* not verified */ }
-   ```
-
-### ⚠️ Potential Improvements
-
-1. **HTTPS only** (currently HTTP)
-   ```go
-   store.Options = &sessions.Options{
-       Secure: true,  // Only send over HTTPS
-   }
-   ```
-
-2. **Session key from environment**
-   ```go
-   // ❌ Hardcoded
-   const sessionKey = "a-very-secret-key-32-bytes-long"
-
-   // ✅ From environment
-   sessionKey := os.Getenv("SESSION_KEY")
-   ```
-
-3. **Rate limiting login attempts**
-   ```go
-   // Prevent brute force attacks
-   if attempts > 5 {
-       // Block for 15 minutes
-   }
-   ```
-
-4. **Password strength requirements**
-   ```go
-   if len(password) < 8 {
-       return errors.New("password must be at least 8 characters")
-   }
-   ```
-
-5. **Two-factor authentication (2FA)**
-   ```go
-   // Optional: Send code to phone
-   ```
-
----
-
-## Complete Authentication Example
-
-### Registration → Verification → Login
-
-**1. User Registers:**
+**✅ Using bcrypt:**
 ```go
-// POST /register
-username: "john"
-email: "john@example.com"
-password: "password123"
-    ↓
-hashedPassword = bcrypt.GenerateFromPassword("password123")
-token = generateToken()  // "a7f3b82c..."
-expiry = time.Now().Add(24 * time.Hour)
-    ↓
-INSERT INTO users (username, email, password_hash, verification_token, token_expiry, is_verified)
-VALUES ("john", "john@example.com", "$2a$10$...", "a7f3b82c...", "2024-01-16 10:00:00", FALSE)
-    ↓
-Email sent with link: http://localhost:8080/verify?token=a7f3b82c...
+bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 ```
 
-**2. User Clicks Email Link:**
+**✅ Never comparing plain passwords:**
 ```go
-// GET /verify?token=a7f3b82c...
-    ↓
-UPDATE users
-SET is_verified = TRUE, verification_token = NULL
-WHERE verification_token = "a7f3b82c..." AND token_expiry > NOW()
-    ↓
-1 row updated → Success!
+// ❌ NEVER do this!
+if password == user.Password { ... }
+
+// ✅ Always do this!
+bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password))
 ```
 
-**3. User Logs In:**
+### 2. Session Security ✅
+
+**✅ HttpOnly cookies:**
 ```go
-// POST /login
-username: "john"
-password: "password123"
-    ↓
-SELECT id, password_hash, is_verified FROM users WHERE username = "john"
-    ↓
-bcrypt.CompareHashAndPassword(stored_hash, "password123")  → Match!
-    ↓
-session.Values["user_id"] = 1
-session.Save()  → Set-Cookie: session=xyz789...
-    ↓
-Redirect to /dashboard
+store.Options = &sessions.Options{
+	HttpOnly: true,  // JavaScript can't access
+}
+```
+Prevents XSS attacks from stealing session cookies.
+
+**✅ Secure cookies:**
+```go
+store.Options = &sessions.Options{
+	Secure: true,  // Only sent over HTTPS
+}
+```
+Prevents man-in-the-middle attacks.
+
+**✅ Encrypted session data:**
+```go
+store = sessions.NewCookieStore([]byte(sessionKey))
+```
+Cookie contents are encrypted, can't be read or tampered with.
+
+### 3. SQL Injection Prevention ✅
+
+**✅ Always using parameterized queries:**
+```go
+db.Exec("INSERT INTO users (username, email) VALUES (?, ?)", username, email)
+//                                                     ↑  ↑
+//                                                     Placeholders
 ```
 
-**4. User Visits Dashboard:**
+**❌ NEVER concatenating SQL:**
 ```go
-// GET /dashboard
-Cookie: session=xyz789...
-    ↓
-requireAuth middleware:
-    session = store.Get(r, "session")
-    userID = session.Values["user_id"]  // 1
-    user = getCurrentUser()  // Query DB for user 1
-    ↓
-dashboardHandler renders page with user data
+// NEVER do this!
+query := "SELECT * FROM users WHERE username = '" + username + "'"
 ```
 
-**5. User Logs Out:**
+### 4. Token Security ✅
+
+**✅ Cryptographically secure random:**
 ```go
-// GET /logout
-Cookie: session=xyz789...
-    ↓
-session.Values["user_id"] = deleted
-session.Save()  → Set-Cookie: session=xyz789... (but empty)
-    ↓
-Redirect to /
+rand.Read(b)  // crypto/rand, not math/rand
 ```
 
----
-
-## Practice Exercises
-
-### Exercise 1: Check if User is Logged In
-
+**✅ Token expiry:**
 ```go
-func someHandler(w http.ResponseWriter, r *http.Request) {
-    user, err := getCurrentUser(r)
-    if err != nil {
-        // What should you do?
-    }
+expiry := time.Now().Add(24 * time.Hour)
+```
+
+**✅ Single use (cleared after use):**
+```go
+UPDATE users SET verification_token = NULL WHERE ...
+```
+
+### 5. Information Disclosure Prevention ✅
+
+**✅ Generic error messages:**
+```go
+// Don't reveal if username exists
+"Invalid username or password"  // Not "Username not found"
+```
+
+**✅ Same message for existing/non-existing emails:**
+```go
+"If an account exists with this email, a password reset link has been sent."
+```
+
+### 6. Email Verification Required ✅
+
+**✅ Checking is_verified:**
+```go
+if !user.IsVerified {
+	// Can't access protected pages
 }
 ```
 
-**Answer:**
+---
+
+## 🎓 Common Attack Vectors (and how your code prevents them)
+
+### 1. Brute Force Password Attacks
+
+**Attack:** Try many passwords rapidly
+
+**Your defense:**
+- ✅ bcrypt is slow (100ms per attempt)
+- ✅ Trying 1 million passwords = 27+ hours
+
+**Could add:**
+- Rate limiting (max 5 login attempts per minute)
+- Account lockout after failed attempts
+- CAPTCHA after multiple failures
+
+### 2. Session Hijacking
+
+**Attack:** Steal someone's session cookie
+
+**Your defense:**
+- ✅ HttpOnly = JavaScript can't access
+- ✅ Secure = Only sent over HTTPS
+- ✅ Encrypted = Can't be read or modified
+
+### 3. SQL Injection
+
+**Attack:** Inject malicious SQL code
+
+**Your defense:**
+- ✅ Always using `?` placeholders
+- ✅ Database driver escapes inputs
+
+**Example blocked attack:**
 ```go
-if err != nil {
-    // User not logged in
-    http.Redirect(w, r, "/login", http.StatusSeeOther)
-    return
-}
+username = "' OR '1'='1' --"
+
+// With concatenation (VULNERABLE):
+query = "SELECT * FROM users WHERE username = '" + username + "'"
+// Becomes: SELECT * FROM users WHERE username = '' OR '1'='1' --'
+// Returns ALL users!
+
+// With placeholders (SAFE):
+db.QueryRow("SELECT * FROM users WHERE username = ?", username)
+// username treated as string value, not SQL code
 ```
 
-### Exercise 2: Verify Password
+### 4. Cross-Site Scripting (XSS)
 
-Check if password "mypassword" matches hash "$2a$10$abc...":
+**Attack:** Inject JavaScript into pages
 
-**Answer:**
+**Your defense:**
+- ✅ HTML template auto-escapes output
+- ✅ HttpOnly cookies can't be stolen by scripts
+
+**Example:**
 ```go
-err := bcrypt.CompareHashAndPassword([]byte("$2a$10$abc..."), []byte("mypassword"))
-if err != nil {
-    fmt.Println("Wrong password")
+// User submits comment: <script>alert('XSS')</script>
+
+// Template automatically escapes:
+{{.Content}}
+// Renders as: &lt;script&gt;alert('XSS')&lt;/script&gt;
+// Shows as text, doesn't execute!
+```
+
+### 5. Cross-Site Request Forgery (CSRF)
+
+**Attack:** Trick user into submitting malicious request
+
+**Your defense:**
+- ✅ SameSite cookies (modern browsers)
+- ✅ Require logged-in session
+
+**Could add:**
+- CSRF tokens in forms
+
+### 6. User Enumeration
+
+**Attack:** Discover which emails are registered
+
+**Your defense:**
+- ✅ Same message whether email exists or not
+- ✅ "If an account exists..." pattern
+
+```go
+// ❌ Reveals info
+if emailExists {
+	return "Reset link sent"
 } else {
-    fmt.Println("Correct password")
+	return "Email not found"  // Attacker knows email not registered!
 }
+
+// ✅ Doesn't reveal info
+return "If an account exists with this email, a password reset link has been sent."
 ```
 
 ---
 
-## Key Takeaways
+## 📊 Complete Authentication Flow Diagram
 
-✅ **Never store plain passwords** - Use bcrypt
-✅ **Bcrypt is one-way** - Can't reverse the hash
-✅ **Tokens must be random** - Use crypto/rand
-✅ **Sessions use cookies** - Automatically included in requests
-✅ **HttpOnly cookies** - JavaScript can't access
-✅ **MaxAge** - Sessions expire after 7 days
-✅ **Middleware** - Protects routes (requireAuth, requireAdmin)
-✅ **Context** - Passes user data to handlers
-✅ **Email verification** - Confirms real email address
+```
+┌──────────────────────────────────────────────────┐
+│              USER REGISTRATION                   │
+└──────────────────┬───────────────────────────────┘
+                   ↓
+         Fill registration form
+                   ↓
+         Submit → registerHandler
+                   ↓
+         ┌─────────────────────┐
+         │ 1. Hash password    │
+         │ 2. Generate token   │
+         │ 3. Save to database │
+         │ 4. Send email       │
+         └─────────┬───────────┘
+                   ↓
+         User receives email
+                   ↓
+         Click verification link
+                   ↓
+         verifyHandler
+                   ↓
+         ┌─────────────────────┐
+         │ 1. Check token      │
+         │ 2. Set is_verified  │
+         │ 3. Clear token      │
+         └─────────┬───────────┘
+                   ↓
+         Email verified! ✅
+                   ↓
+┌──────────────────────────────────────────────────┐
+│                   USER LOGIN                     │
+└──────────────────┬───────────────────────────────┘
+                   ↓
+         Fill login form
+                   ↓
+         Submit → loginHandler
+                   ↓
+         ┌─────────────────────┐
+         │ 1. Look up user     │
+         │ 2. Verify password  │
+         │ 3. Create session   │
+         │ 4. Send cookie      │
+         └─────────┬───────────┘
+                   ↓
+         Logged in! ✅
+                   ↓
+┌──────────────────────────────────────────────────┐
+│              PROTECTED PAGES                     │
+└──────────────────┬───────────────────────────────┘
+                   ↓
+         Visit /dashboard
+                   ↓
+         requireAuth middleware
+                   ↓
+         ┌─────────────────────┐
+         │ 1. Read session     │
+         │ 2. Get user ID      │
+         │ 3. Query database   │
+         │ 4. Check verified   │
+         └─────────┬───────────┘
+                   ↓
+         ┌─YES─┐   │   ┌─NO──┐
+         │     ↓       ↓      │
+    dashboardHandler  Redirect /login
+```
 
 ---
 
-**Next Chapter:** Middleware patterns - wrapping handlers to add functionality!
+## 💡 Key Takeaways
+
+✅ **bcrypt makes passwords uncrackable** - Never store plain passwords
+✅ **Sessions remember logged-in users** - Encrypted cookies
+✅ **Email verification prevents spam** - Users must own their email
+✅ **Password reset is secure** - Tokens expire, single-use
+✅ **Middleware protects routes** - requireAuth, requireAdmin
+✅ **HttpOnly cookies prevent XSS theft** - JavaScript can't access
+✅ **Secure cookies prevent interception** - Only sent over HTTPS
+✅ **Parameterized queries prevent SQL injection** - Always use `?`
+✅ **Generic error messages prevent enumeration** - Don't reveal info
+✅ **Token expiry prevents replay attacks** - Limited time window
+
+---
+
+## 🚀 What's Next?
+
+**You've completed the core learning materials!**
+
+You now understand:
+- ✅ Chapter 3: All imports and dependencies
+- ✅ Chapter 4: Data structures (structs)
+- ✅ Chapter 5: Database operations
+- ✅ Chapter 6: HTTP routing and handlers
+- ✅ Chapter 7: Authentication and security
+
+**Additional topics to explore:**
+- Gemini AI integration (how the chatbot works)
+- HTML templates and frontend
+- HTTPS and SSL certificates
+- Deployment and production
+- Testing and debugging
+
+---
+
+**Remember:** Security is not optional - it's fundamental! Your app follows industry best practices to keep user data safe. 🔐
+
+---
+
+*Congratulations on completing the learning materials! You're now ready to confidently modify and extend your Go application!* 🎉

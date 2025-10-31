@@ -9,9 +9,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"net/smtp"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +34,10 @@ const (
 	// Session key
 	sessionKey = "a-very-secret-key-32-bytes-long"
 	// Base URL
-	baseURL = "http://localhost:8080"
+	baseURL = "https://explorer.needgreatersglobal.com"
+	// SSL Certificate paths
+	certFile = "/etc/letsencrypt/live/explorer.needgreatersglobal.com/fullchain.pem"
+	keyFile  = "/etc/letsencrypt/live/explorer.needgreatersglobal.com/privkey.pem"
 	// Gemini AI Config
 	geminiAPIKey = "AIzaSyD6NfOys90qNnnV597M_u_ePTnR1k-8r1w"
 	geminiAPIURL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
@@ -50,7 +56,7 @@ You are a classification bot for a Kosovo tourism and consulting website.
 Your job is to understand what the user wants and classify their intent.
 
 Respond with ONLY ONE WORD from this list:
-- "counseling" - if they want appointments, booking, consulting, therapy, or mention Abel Tattersall
+- "counseling" - if they want appointments, booking, consulting, or mention Abel Tattersall
 - "places" - if they want to find, see, visit, explore ANY location, attraction, or place in Kosovo
 - "other" - for general greetings or unrelated questions
 
@@ -58,7 +64,6 @@ Examples:
 User: "I want to see castles" -> places
 User: "Show me historical sites" -> places
 User: "Where can I find good restaurants?" -> places
-User: "I need therapy" -> counseling
 User: "Book a consultation" -> counseling
 User: "Hello" -> other
 User: "What museums are there?" -> places
@@ -206,6 +211,7 @@ func main() {
 		Path:     "/",
 		MaxAge:   86400 * 7, // 7 days
 		HttpOnly: true,
+		Secure:   true, // Only send cookies over HTTPS
 	}
 
 	// 3. Parse Templates
@@ -222,9 +228,9 @@ func main() {
 	mux := http.NewServeMux()
 	setupRoutes(mux)
 
-	// 5. Start Server
-	log.Println("Starting server on " + baseURL + " ...")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	// 5. Start HTTPS Server
+	log.Println("Starting HTTPS server on " + baseURL + " ...")
+	if err := http.ListenAndServeTLS(":443", certFile, keyFile, mux); err != nil {
 		log.Fatal("Failed to start server:", err)
 	}
 }
@@ -232,6 +238,7 @@ func main() {
 // --- ROUTE SETUP ---
 func setupRoutes(mux *http.ServeMux) {
 	// --- Static/Public Routes ---
+	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("uploads"))))
 	mux.HandleFunc("/", homeHandler)
 	mux.HandleFunc("/register", registerHandler)
 	mux.HandleFunc("/login", loginHandler)
@@ -1277,16 +1284,57 @@ func commentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := r.Context().Value("user").(User)
+
+	// Parse multipart form (max 5MB)
+	err := r.ParseMultipartForm(5 << 20)
+	if err != nil {
+		http.Error(w, "File too large or invalid form", http.StatusBadRequest)
+		return
+	}
+
 	placeID, _ := strconv.Atoi(r.FormValue("place_id"))
 	content := r.FormValue("content")
-	imageURL := r.FormValue("image_url")
 
 	if content == "" {
 		http.Error(w, "Comment cannot be empty", http.StatusBadRequest)
 		return
 	}
 
-	_, err := db.Exec(`
+	var imageURL string
+
+	// Handle file upload
+	file, handler, err := r.FormFile("image")
+	if err == nil {
+		defer file.Close()
+
+		// Create uploads directory if it doesn't exist
+		os.MkdirAll("./uploads", os.ModePerm)
+
+		// Generate unique filename
+		ext := filepath.Ext(handler.Filename)
+		filename := fmt.Sprintf("%d_%d%s", user.ID, time.Now().Unix(), ext)
+		fullPath := filepath.Join("uploads", filename)
+
+		// Create the file
+		dst, err := os.Create(fullPath)
+		if err != nil {
+			log.Printf("Error creating file: %v", err)
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+		defer dst.Close()
+
+		// Copy the uploaded file to the destination
+		if _, err := io.Copy(dst, file); err != nil {
+			log.Printf("Error saving file: %v", err)
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+
+		imageURL = "/uploads/" + filename
+	}
+
+	_, err = db.Exec(`
 		INSERT INTO comments (place_id, user_id, content, image_url)
 		VALUES (?, ?, ?, ?)
 	`, placeID, user.ID, content, imageURL)
@@ -1931,6 +1979,29 @@ const allTemplates = `
             background: rgba(0, 0, 0, 0.7);
         }
 
+        /* Enhanced date input styling */
+        .form-group input[type="date"] {
+            position: relative;
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+        }
+
+        .form-group input[type="date"]::-webkit-calendar-picker-indicator {
+            cursor: pointer;
+            filter: invert(1);
+            opacity: 0.8;
+            font-size: 1.2rem;
+        }
+
+        .form-group input[type="date"]::-webkit-calendar-picker-indicator:hover {
+            opacity: 1;
+        }
+
+        .form-group input[type="date"]:focus {
+            border-color: rgba(102, 126, 234, 0.7);
+            background: rgba(0, 0, 0, 0.7);
+        }
+
         .dashboard-card {
             background: var(--card-bg);
             border: 1px solid var(--border-color);
@@ -2170,21 +2241,167 @@ const allTemplates = `
         }
 
         @media (max-width: 768px) {
-            .hero h1 {
-                font-size: 2rem;
+            .navbar {
+                padding: 1rem;
             }
-            
-            .navbar-links {
+
+            .navbar-content {
                 flex-direction: column;
                 gap: 1rem;
             }
-            
+
+            .navbar-brand {
+                font-size: 1.25rem;
+            }
+
+            .navbar-links {
+                flex-direction: row;
+                flex-wrap: wrap;
+                gap: 0.75rem;
+                justify-content: center;
+                font-size: 0.9rem;
+            }
+
+            .container {
+                padding: 1rem;
+            }
+
+            .hero {
+                padding: 2rem 1rem;
+                margin-bottom: 2rem;
+            }
+
+            .hero h1 {
+                font-size: 2rem;
+                line-height: 1.2;
+            }
+
+            .hero p {
+                font-size: 1rem;
+                padding: 0 0.5rem;
+            }
+
+            .btn {
+                padding: 0.875rem 1.5rem;
+                font-size: 0.95rem;
+                width: 100%;
+                max-width: 300px;
+            }
+
+            .card-grid {
+                grid-template-columns: 1fr;
+                gap: 1.25rem;
+            }
+
+            .card {
+                padding: 1.5rem;
+            }
+
+            .form-card {
+                padding: 1.5rem;
+                border-radius: 15px;
+            }
+
+            .form-group input,
+            .form-group select,
+            .form-group textarea {
+                font-size: 16px; /* Prevents zoom on iOS */
+                padding: 0.875rem;
+            }
+
+            .dashboard-card {
+                padding: 1.5rem;
+            }
+
+            .admin-table {
+                font-size: 0.85rem;
+            }
+
+            .admin-table th,
+            .admin-table td {
+                padding: 0.75rem 0.5rem;
+            }
+
+            #map {
+                height: 400px;
+                border-radius: 10px;
+            }
+
+            .map-controls {
+                padding: 1rem;
+            }
+
             .places-grid {
                 grid-template-columns: 1fr;
+                gap: 1.25rem;
             }
-            
+
+            .place-card {
+                padding: 1.25rem;
+            }
+
+            .chat-container {
+                border-radius: 15px;
+            }
+
+            .chat-messages {
+                height: 400px;
+                padding: 1rem;
+            }
+
             .chat-message {
                 max-width: 85%;
+                padding: 0.875rem 1rem;
+                font-size: 0.95rem;
+            }
+
+            .chat-input {
+                padding: 1rem;
+                gap: 0.75rem;
+            }
+
+            .chat-input input {
+                padding: 0.875rem;
+                font-size: 16px; /* Prevents zoom on iOS */
+            }
+
+            .comment-section {
+                padding: 1.25rem;
+            }
+
+            .comment {
+                padding: 0.875rem;
+            }
+
+            /* Better touch targets for mobile */
+            a, button, input[type="submit"], input[type="file"] {
+                min-height: 44px;
+                min-width: 44px;
+            }
+
+            /* Stack form buttons on mobile */
+            .form-card button[type="submit"] {
+                width: 100%;
+            }
+        }
+
+        /* Extra small devices */
+        @media (max-width: 480px) {
+            .hero h1 {
+                font-size: 1.75rem;
+            }
+
+            .navbar-links {
+                font-size: 0.85rem;
+                gap: 0.5rem;
+            }
+
+            .card h3 {
+                font-size: 1.25rem;
+            }
+
+            .chat-messages {
+                height: 350px;
             }
         }
     </style>
@@ -2831,16 +3048,16 @@ const allTemplates = `
         <h2>Comments ({{len .Data.Comments}})</h2>
         
         {{if .CurrentUser.ID}}
-        <form action="/api/comment" method="POST" style="margin-bottom: 2rem;">
+        <form action="/api/comment" method="POST" enctype="multipart/form-data" style="margin-bottom: 2rem;">
             <input type="hidden" name="place_id" value="{{.Data.Place.ID}}">
             <div class="form-group">
                 <label for="content">Add a comment</label>
                 <textarea id="content" name="content" rows="3" required placeholder="Share your experience..."></textarea>
             </div>
             <div class="form-group">
-                <label for="image_url">Image URL (optional)</label>
-                <input type="url" id="image_url" name="image_url" placeholder="https://example.com/image.jpg">
-                <small style="color: var(--text-gray); font-size: 0.85rem;">Add a single image to your comment by providing a URL</small>
+                <label for="image">Add Image (optional)</label>
+                <input type="file" id="image" name="image" accept="image/jpeg,image/png,image/jpg,image/gif,image/webp" style="padding: 0.5rem; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border-color); border-radius: 10px; color: white; width: 100%;">
+                <small style="color: var(--text-gray); font-size: 0.85rem;">Upload a photo from your device (max 5MB)</small>
             </div>
             <button type="submit" class="btn">Post Comment</button>
         </form>
@@ -2960,15 +3177,18 @@ const allTemplates = `
             if (data.content.showForm) {
                 aiHTML += '<div style="margin-top: 1rem; padding: 1rem; background: rgba(255,255,255,0.05); border-radius: 10px;">';
                 aiHTML += '<h4 style="margin-bottom: 1rem;">Quick Consultation Booking</h4>';
-                aiHTML += '<form onsubmit="handleQuickConsult(event); return false;">';
+                aiHTML += '<form id="quick-consult-form" onsubmit="handleQuickConsult(event); return false;">';
                 aiHTML += '<div style="margin-bottom: 0.75rem;">';
-                aiHTML += '<input type="text" placeholder="Your Name" required style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white;">';
+                aiHTML += '<input type="text" name="name" placeholder="Your Name" required style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white; font-size: 16px;">';
                 aiHTML += '</div>';
                 aiHTML += '<div style="margin-bottom: 0.75rem;">';
-                aiHTML += '<input type="email" placeholder="Your Email" required style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white;">';
+                aiHTML += '<input type="email" name="email" placeholder="Your Email" required style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white; font-size: 16px;">';
                 aiHTML += '</div>';
                 aiHTML += '<div style="margin-bottom: 0.75rem;">';
-                aiHTML += '<textarea placeholder="Brief description of your needs" rows="3" required style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white;"></textarea>';
+                aiHTML += '<input type="date" name="date" required style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white; font-size: 16px;">';
+                aiHTML += '</div>';
+                aiHTML += '<div style="margin-bottom: 0.75rem;">';
+                aiHTML += '<textarea name="message" placeholder="Brief description of your needs" rows="3" style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.2); border-radius: 5px; color: white; font-size: 16px;"></textarea>';
                 aiHTML += '</div>';
                 aiHTML += '<button type="submit" class="btn" style="width: 100%;">Submit Request</button>';
                 aiHTML += '</form>';
@@ -3036,11 +3256,40 @@ const allTemplates = `
 }
 
 // Add this new function right after handleAIResponse
-function handleQuickConsult(event) {
+async function handleQuickConsult(event) {
     event.preventDefault();
-    alert('Consultation request submitted! (This is a demo - implement actual submission)');
-    addMessage('user', 'I submitted a consultation request');
-    addMessage('ai', 'Thank you! Your consultation request has been received. Abel Tattersall will contact you soon at the email you provided.');
+
+    const form = event.target;
+    const formData = new FormData(form);
+    const submitBtn = form.querySelector('button[type="submit"]');
+
+    // Disable submit button
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Submitting...';
+
+    try {
+        const response = await fetch('/api/counseling/submit', {
+            method: 'POST',
+            body: formData
+        });
+
+        const data = await response.json();
+
+        if (data.status === 'success' || data.status === 'partial') {
+            addMessage('user', 'I submitted a consultation request');
+            addMessage('ai', 'Thank you! Your consultation request has been received. Abel Tattersall will contact you soon at the email you provided.');
+            form.reset();
+        } else {
+            addMessage('ai', 'Sorry, there was an error submitting your request: ' + (data.message || 'Please try again or use the full booking form.'));
+        }
+    } catch (error) {
+        console.error('Submission error:', error);
+        addMessage('ai', 'Sorry, there was an error submitting your request. Please try again or use the <a href="/counseling" style="color: #667eea;">full booking form</a>.');
+    } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Submit Request';
+    }
+
     return false;
 }
 </script>
@@ -3068,7 +3317,8 @@ function handleQuickConsult(event) {
             </div>
             <div class="form-group">
                 <label for="date">Preferred Date</label>
-                <input type="date" id="date" name="date" required>
+                <input type="date" id="date" name="date" required style="cursor: pointer;">
+                <small style="color: var(--text-gray); font-size: 0.85rem;">Select a date from the calendar</small>
             </div>
             <div class="form-group">
                 <label for="message">Reason for Appointment</label>
@@ -3080,6 +3330,14 @@ function handleQuickConsult(event) {
 </div>
 
 <script>
+// Set minimum date to today
+const dateInput = document.getElementById('date');
+const today = new Date().toISOString().split('T')[0];
+dateInput.setAttribute('min', today);
+
+// Set default value to today for better UX
+dateInput.value = today;
+
 document.getElementById('counseling-form').addEventListener('submit', async (e) => {
     e.preventDefault();
 
