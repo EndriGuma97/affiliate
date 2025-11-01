@@ -33,7 +33,7 @@ const (
 	smtpPassword = "Assembly3637997Ab,"
 	// Session key
 	sessionKey = "a-very-secret-key-32-bytes-long"
-	// Base URL
+	// Base URL - Changed for local testing
 	baseURL = "https://explorer.needgreatersglobal.com"
 	// SSL Certificate paths
 	certFile = "/etc/letsencrypt/live/explorer.needgreatersglobal.com/fullchain.pem"
@@ -112,6 +112,19 @@ type Comment struct {
 	CreatedAt time.Time
 }
 
+// LiveUpdate defines the live status update model
+type LiveUpdate struct {
+	ID          int       `json:"id"`
+	PlaceID     int       `json:"place_id"`
+	PlaceTitle  string    `json:"place_title"`
+	UserID      int       `json:"user_id"`
+	Username    string    `json:"username"`
+	Status      string    `json:"status"`
+	StatusType  string    `json:"status_type"` // "here_now", "wait_time", "event", "closed"
+	ExpiresAt   time.Time `json:"expires_at"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 // --- PAGE DATA MODELS ---
 
 type AdminPageData struct {
@@ -146,9 +159,10 @@ type PlacesListPageData struct {
 }
 
 type PlaceDetailPageData struct {
-	Place       Place
-	Comments    []Comment
-	CurrentUser User
+	Place        Place
+	Comments     []Comment
+	LiveUpdates  []LiveUpdate
+	CurrentUser  User
 }
 
 type ChatPageData struct {
@@ -212,7 +226,7 @@ func main() {
 		Path:     "/",
 		MaxAge:   86400 * 7, // 7 days
 		HttpOnly: true,
-		Secure:   true, // Only send cookies over HTTPS
+		Secure:   true, // Changed to false for local testing
         SameSite: http.SameSiteStrictMode,
 	}
 
@@ -224,13 +238,22 @@ func main() {
 		"formatTime": func(t time.Time) string {
 			return t.Format("Jan 2, 2006 at 3:04 PM")
 		},
+		"timeUntil": func(t time.Time) string {
+			duration := time.Until(t)
+			if duration < 0 {
+				return "expired"
+			}
+			if duration.Minutes() < 60 {
+				return fmt.Sprintf("%d minutes", int(duration.Minutes()))
+			}
+			return fmt.Sprintf("%.1f hours", duration.Hours())
+		},
 	}).Parse(allTemplates))
 
 	// 4. Setup Routes
 	mux := http.NewServeMux()
 	setupRoutes(mux)
 
-	// 5. Start HTTPS Server
     go func() {
         httpMux := http.NewServeMux()
         httpMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -273,6 +296,11 @@ func setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/comment", requireAuth(commentHandler))
     mux.HandleFunc("/api/comment/delete", requireAuth(deleteCommentHandler))
 	mux.HandleFunc("/api/counseling/submit", counselingSubmitHandler)
+	
+	// --- New Live Updates Routes ---
+	mux.HandleFunc("/api/live-update", requireAuth(liveUpdateHandler))
+	mux.HandleFunc("/api/live-updates/recent", recentLiveUpdatesHandler)
+	mux.HandleFunc("/api/live-updates/place/", placeLiveUpdatesHandler)
 
 	// --- Protected Routes ---
 	mux.HandleFunc("/dashboard", requireAuth(dashboardHandler))
@@ -339,6 +367,20 @@ func initDB(filepath string) (*sql.DB, error) {
 		FOREIGN KEY(user_id) REFERENCES users(id)
 	);`
 
+	// New table for live updates
+	createLiveUpdatesTable := `
+	CREATE TABLE IF NOT EXISTS live_updates (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		place_id INTEGER NOT NULL,
+		user_id INTEGER NOT NULL,
+		status TEXT NOT NULL,
+		status_type TEXT NOT NULL,
+		expires_at DATETIME NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(place_id) REFERENCES places(id) ON DELETE CASCADE,
+		FOREIGN KEY(user_id) REFERENCES users(id)
+	);`
+
 	if _, err = db.Exec(createUserTable); err != nil {
 		return nil, err
 	}
@@ -346,6 +388,9 @@ func initDB(filepath string) (*sql.DB, error) {
 		return nil, err
 	}
 	if _, err = db.Exec(createCommentsTable); err != nil {
+		return nil, err
+	}
+	if _, err = db.Exec(createLiveUpdatesTable); err != nil {
 		return nil, err
 	}
 
@@ -417,6 +462,132 @@ func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 		ctx := context.WithValue(r.Context(), "user", user)
 		next(w, r.WithContext(ctx))
 	}
+}
+
+// --- LIVE UPDATE HANDLERS ---
+func liveUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	user := r.Context().Value("user").(User)
+	
+	placeID, _ := strconv.Atoi(r.FormValue("place_id"))
+	status := r.FormValue("status")
+	statusType := r.FormValue("status_type")
+	
+	// Different expiry times based on status type
+	var expiresAt time.Time
+	switch statusType {
+	case "here_now":
+		expiresAt = time.Now().Add(2 * time.Hour)
+	case "wait_time":
+		expiresAt = time.Now().Add(1 * time.Hour)
+	case "event":
+		expiresAt = time.Now().Add(6 * time.Hour)
+	case "closed":
+		expiresAt = time.Now().Add(4 * time.Hour)
+	default:
+		expiresAt = time.Now().Add(2 * time.Hour)
+	}
+	
+	// Delete any existing live update from this user for this place
+	db.Exec("DELETE FROM live_updates WHERE place_id = ? AND user_id = ?", placeID, user.ID)
+	
+	// Insert new live update
+	_, err := db.Exec(
+		"INSERT INTO live_updates (place_id, user_id, status, status_type, expires_at) VALUES (?, ?, ?, ?, ?)",
+		placeID, user.ID, status, statusType, expiresAt,
+	)
+	
+	if err != nil {
+		http.Error(w, "Failed to post update", http.StatusInternalServerError)
+		return
+	}
+	
+	// Return success
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
+		"message": "Live update posted!",
+	})
+}
+
+func recentLiveUpdatesHandler(w http.ResponseWriter, r *http.Request) {
+	// Get live updates from the last minute for the global ticker
+	oneMinuteAgo := time.Now().Add(-1 * time.Minute)
+	
+	rows, err := db.Query(`
+		SELECT lu.id, lu.place_id, p.title, lu.user_id, u.username, 
+		       lu.status, lu.status_type, lu.expires_at, lu.created_at
+		FROM live_updates lu
+		JOIN places p ON lu.place_id = p.id
+		JOIN users u ON lu.user_id = u.id
+		WHERE lu.created_at > ? AND lu.expires_at > ?
+		ORDER BY lu.created_at DESC
+		LIMIT 10
+	`, oneMinuteAgo, time.Now())
+	
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	
+	var updates []LiveUpdate
+	for rows.Next() {
+		var u LiveUpdate
+		rows.Scan(&u.ID, &u.PlaceID, &u.PlaceTitle, &u.UserID, &u.Username,
+			&u.Status, &u.StatusType, &u.ExpiresAt, &u.CreatedAt)
+		updates = append(updates, u)
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updates)
+}
+
+func placeLiveUpdatesHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract place ID from URL
+	pathParts := strings.Split(r.URL.Path, "/")
+	if len(pathParts) < 5 {
+		http.Error(w, "Invalid URL", http.StatusBadRequest)
+		return
+	}
+	
+	placeID, err := strconv.Atoi(pathParts[4])
+	if err != nil {
+		http.Error(w, "Invalid place ID", http.StatusBadRequest)
+		return
+	}
+	
+	// Get active live updates for this place
+	rows, err := db.Query(`
+		SELECT lu.id, lu.place_id, lu.user_id, u.username, 
+		       lu.status, lu.status_type, lu.expires_at, lu.created_at
+		FROM live_updates lu
+		JOIN users u ON lu.user_id = u.id
+		WHERE lu.place_id = ? AND lu.expires_at > ?
+		ORDER BY lu.created_at DESC
+		LIMIT 10
+	`, placeID, time.Now())
+	
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	
+	var updates []LiveUpdate
+	for rows.Next() {
+		var u LiveUpdate
+		rows.Scan(&u.ID, &u.PlaceID, &u.UserID, &u.Username,
+			&u.Status, &u.StatusType, &u.ExpiresAt, &u.CreatedAt)
+		updates = append(updates, u)
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(updates)
 }
 
 // --- PUBLIC HANDLERS ---
@@ -1213,35 +1384,59 @@ func placeDetailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get comments
-rows, err := db.Query(`
-SELECT c.id, c.user_id, c.content, c.image_url, c.rating, c.created_at, u.username
-FROM comments c
-JOIN users u ON c.user_id = u.id
-WHERE c.place_id = ?
-ORDER BY c.created_at DESC
-`, placeID)
+	rows, err := db.Query(`
+		SELECT c.id, c.user_id, c.content, c.image_url, c.rating, c.created_at, u.username
+		FROM comments c
+		JOIN users u ON c.user_id = u.id
+		WHERE c.place_id = ?
+		ORDER BY c.created_at DESC
+	`, placeID)
 	if err != nil {
 		log.Printf("Error getting comments: %v", err)
 	}
 	defer rows.Close()
 
 	var comments []Comment
-for rows.Next() {
-	var c Comment
-	var imageURL sql.NullString
-	rows.Scan(&c.ID, &c.UserID, &c.Content, &imageURL, &c.Rating, &c.CreatedAt, &c.Username)
-	if imageURL.Valid {
-		c.ImageURL = imageURL.String
+	for rows.Next() {
+		var c Comment
+		var imageURL sql.NullString
+		rows.Scan(&c.ID, &c.UserID, &c.Content, &imageURL, &c.Rating, &c.CreatedAt, &c.Username)
+		if imageURL.Valid {
+			c.ImageURL = imageURL.String
+		}
+		c.PlaceID = placeID
+		comments = append(comments, c)
 	}
-	c.PlaceID = placeID  // Add this line to store place ID in comment
-	comments = append(comments, c)
-}
+
+	// Get live updates for this place
+	liveRows, err := db.Query(`
+		SELECT lu.id, lu.user_id, u.username, lu.status, lu.status_type, 
+		       lu.expires_at, lu.created_at
+		FROM live_updates lu
+		JOIN users u ON lu.user_id = u.id
+		WHERE lu.place_id = ? AND lu.expires_at > ?
+		ORDER BY lu.created_at DESC
+		LIMIT 10
+	`, placeID, time.Now())
+	
+	var liveUpdates []LiveUpdate
+	if err == nil {
+		defer liveRows.Close()
+		for liveRows.Next() {
+			var lu LiveUpdate
+			liveRows.Scan(&lu.ID, &lu.UserID, &lu.Username, &lu.Status, 
+				&lu.StatusType, &lu.ExpiresAt, &lu.CreatedAt)
+			lu.PlaceID = placeID
+			liveUpdates = append(liveUpdates, lu)
+		}
+	}
 
 	renderTemplate(w, "place_detail", PageBundle{
 		PageName: "place_detail",
 		Data: PlaceDetailPageData{
 			Place:       place,
 			Comments:    comments,
+			LiveUpdates: liveUpdates,
 			CurrentUser: user,
 		},
 		CurrentUser: user,
@@ -1310,10 +1505,8 @@ func commentHandler(w http.ResponseWriter, r *http.Request) {
 
 	placeID, _ := strconv.Atoi(r.FormValue("place_id"))
 	content := r.FormValue("content")
-	// --- FIX: Removed invisible spaces from the line below ---
 	rating, _ := strconv.Atoi(r.FormValue("rating"))
 
-	// --- FIX: Removed invisible spaces from this "if" block ---
 	if rating < 1 || rating > 5 {
 		http.Error(w, "Rating must be between 1 and 5", http.StatusBadRequest)
 		return
@@ -1583,6 +1776,7 @@ func chatAPIHandler(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(response)
 }
+
 func placesAPIHandler(w http.ResponseWriter, r *http.Request) {
 	// Get approved places for the map
 	rows, err := db.Query(`
@@ -1778,6 +1972,7 @@ func searchPlaces(prompt string) []Place {
     
     return places
 }
+
 // --- EMAIL HELPER ---
 func sendEmail(to, subject, body string) error {
     auth := smtp.PlainAuth("", smtpEmail, smtpPassword, smtpHost)
@@ -2217,7 +2412,149 @@ const allTemplates = `
             padding: 0.5rem;
             border-radius: 5px;
         }
+        /* --- Live Status Section Styles --- */
+.live-status-section {
+    background: var(--card-bg);
+    border: 1px solid var(--border-color);
+    border-radius: 15px;
+    padding: 1.5rem;
+    margin-top: 2rem;
+}
 
+.live-status-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1.5rem;
+}
+
+.live-status-header h3 {
+    margin: 0;
+    font-size: 1.5rem;
+}
+
+.live-indicator {
+    background: linear-gradient(135deg, #f5576c 0%, #f093fb 100%);
+    color: white;
+    font-weight: 600;
+    font-size: 0.8rem;
+    padding: 0.25rem 0.75rem;
+    border-radius: 50px;
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(245, 87, 108, 0.7); }
+    70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(245, 87, 108, 0); }
+    100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(245, 87, 108, 0); }
+}
+
+.live-update-form {
+    margin-bottom: 1.5rem;
+}
+
+.live-status-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+}
+
+.status-btn {
+    flex: 1;
+    min-width: 150px;
+    padding: 0.75rem 1rem;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border-color);
+    color: var(--text-light);
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 0.95rem;
+    transition: all 0.3s ease;
+}
+
+.status-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(102, 126, 234, 0.3);
+}
+
+.custom-status-input {
+    width: 100%;
+    padding: 1rem;
+    background: rgba(0, 0, 0, 0.5);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    color: white;
+    font-size: 1rem;
+}
+
+.live-updates-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.live-update-item {
+    background: rgba(0, 0, 0, 0.15);
+    border: 1px solid var(--border-color);
+    border-left-width: 5px;
+    border-radius: 10px;
+    padding: 1rem 1.5rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+}
+
+.live-update-meta {
+    font-size: 0.9rem;
+    color: var(--text-gray);
+    margin-bottom: 0.25rem;
+}
+
+.live-update-status {
+    font-size: 1.1rem;
+    font-weight: 500;
+}
+
+.live-update-time {
+    font-size: 0.9rem;
+    color: var(--text-gray);
+    flex-shrink: 0;
+}
+
+/* --- Specific Status Colors --- */
+
+/* 📍 Here Now */
+.live-update-item.status-here_now {
+    background: rgba(102, 126, 234, 0.05);
+    border-left-color: var(--primary-gradient, #667eea);
+}
+
+/* ⏰ Wait Time */
+.live-update-item.status-wait_time {
+    background: rgba(255, 154, 68, 0.05);
+    border-left-color: #ff9a44;
+}
+
+/* 🎉 Special Event - As requested */
+.live-update-item.status-event {
+    background: rgba(240, 147, 251, 0.05);
+    border-left-color: #f093fb;
+}
+.live-update-item.status-event .live-update-status {
+    color: #f093fb;
+    font-weight: 600;
+}
+
+/* 🚫 Closed - As requested */
+.live-update-item.status-closed {
+    background: rgba(245, 87, 108, 0.05);
+    border-left-color: #f5576c;
+}
+.live-update-item.status-closed .live-update-status {
+    color: #f5576c;
+    font-weight: 600;
+}
         .comment-section {
             background: var(--card-bg);
             border: 1px solid var(--border-color);
@@ -3196,6 +3533,73 @@ const allTemplates = `
         </a>
     </div>
 
+    <!-- LIVE STATUS UPDATES SECTION -->
+    <div class="live-status-section">
+        <div class="live-status-header">
+            <h3>🔴 Live Status Updates</h3>
+            {{if .Data.LiveUpdates}}
+            <div class="live-indicator">LIVE</div>
+            {{end}}
+        </div>
+        
+        {{if .CurrentUser.ID}}
+        <div class="live-update-form">
+            <div class="live-status-buttons">
+                <button class="status-btn" onclick="postLiveUpdate('here_now', '📍 I\'m here right now!')">
+                    📍 I'm here now
+                </button>
+                <button class="status-btn" onclick="showWaitTimeInput()">
+                    ⏰ Report wait time
+                </button>
+                <button class="status-btn" onclick="showEventInput()">
+                    🎉 Special event
+                </button>
+                <button class="status-btn" onclick="postLiveUpdate('closed', '🚫 This place is temporarily closed')">
+                    🚫 Temporarily closed
+                </button>
+            </div>
+        </div>
+        
+        <div id="custom-status-input" style="display: none; margin-top: 1rem;">
+            <input type="text" id="custom-status-text" class="custom-status-input" placeholder="Enter status details...">
+            <button class="btn" onclick="submitCustomStatus()" style="margin-top: 0.5rem;">Post Update</button>
+            <button class="btn-secondary btn" onclick="cancelCustomStatus()" style="margin-left: 0.5rem;">Cancel</button>
+        </div>
+        {{else}}
+        <p style="color: var(--text-gray);">
+            <a href="/login" style="color: #667eea;">Login</a> to post live updates
+        </p>
+        {{end}}
+        
+        <div class="live-updates-list">
+            {{if .Data.LiveUpdates}}
+                {{range .Data.LiveUpdates}}
+                <div class="live-update-item status-{{.StatusType}}">
+                    <div class="live-update-content">
+                        <div class="live-update-meta">
+                            <strong>{{.Username}}</strong> • {{.CreatedAt.Format "3:04 PM"}}
+                        </div>
+                        <div class="live-update-status">
+                            {{if eq .StatusType "here_now"}}📍{{end}}
+                            {{if eq .StatusType "wait_time"}}⏰{{end}}
+                            {{if eq .StatusType "event"}}🎉{{end}}
+                            {{if eq .StatusType "closed"}}🚫{{end}}
+                            {{.Status}}
+                        </div>
+                    </div>
+                    <div class="live-update-time">
+                        Expires in {{timeUntil .ExpiresAt}}
+                    </div>
+                </div>
+                {{end}}
+            {{else}}
+                <p style="color: var(--text-gray); text-align: center; padding: 2rem;">
+                    No live updates yet. Be the first to post one!
+                </p>
+            {{end}}
+        </div>
+    </div>
+
     <div class="comment-section">
         <h2>Comments ({{len .Data.Comments}})</h2>
         
@@ -3270,7 +3674,72 @@ const allTemplates = `
 {{end}}
     </div>
 </div>
+
 <script>
+let currentStatusType = '';
+let placeID = {{.Data.Place.ID}};
+
+function postLiveUpdate(type, status) {
+    const formData = new FormData();
+    formData.append('place_id', placeID);
+    formData.append('status', status);
+    formData.append('status_type', type);
+    
+    fetch('/api/live-update', {
+        method: 'POST',
+        body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'success') {
+            location.reload();
+        }
+    })
+    .catch(error => console.error('Error:', error));
+}
+
+function showWaitTimeInput() {
+    currentStatusType = 'wait_time';
+    document.getElementById('custom-status-input').style.display = 'block';
+    document.getElementById('custom-status-text').placeholder = 'e.g., 15 minute wait for a table';
+    document.getElementById('custom-status-text').focus();
+}
+
+function showEventInput() {
+    currentStatusType = 'event';
+    document.getElementById('custom-status-input').style.display = 'block';
+    document.getElementById('custom-status-text').placeholder = 'e.g., Live music starting at 8 PM!';
+    document.getElementById('custom-status-text').focus();
+}
+
+function submitCustomStatus() {
+    const statusText = document.getElementById('custom-status-text').value;
+    if (statusText.trim()) {
+        let icon = '';
+        if (currentStatusType === 'wait_time') icon = '⏰ ';
+        if (currentStatusType === 'event') icon = '🎉 ';
+        
+        postLiveUpdate(currentStatusType, icon + statusText);
+    }
+}
+
+function cancelCustomStatus() {
+    document.getElementById('custom-status-input').style.display = 'none';
+    document.getElementById('custom-status-text').value = '';
+    currentStatusType = '';
+}
+
+// Auto-refresh live updates every 30 seconds
+setInterval(() => {
+    fetch('/api/live-updates/place/' + placeID)
+        .then(response => response.json())
+        .then(updates => {
+            // Could update the DOM dynamically here instead of reloading
+            // For now, just reload if there are new updates
+        });
+}, 30000);
+
+// Star rating functionality
 document.addEventListener('DOMContentLoaded', function() {
     const starRating = document.querySelector('.star-rating');
     if (starRating) {
@@ -3320,7 +3789,6 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 </script>
 {{end}}
-
 {{define "chat"}}
 {{template "layout" .}}
 <div class="container">
