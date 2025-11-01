@@ -108,6 +108,7 @@ type Comment struct {
 	Username  string
 	Content   string
 	ImageURL  string
+    Rating int
 	CreatedAt time.Time
 }
 
@@ -212,6 +213,7 @@ func main() {
 		MaxAge:   86400 * 7, // 7 days
 		HttpOnly: true,
 		Secure:   true, // Only send cookies over HTTPS
+        SameSite: http.SameSiteStrictMode,
 	}
 
 	// 3. Parse Templates
@@ -229,10 +231,20 @@ func main() {
 	setupRoutes(mux)
 
 	// 5. Start HTTPS Server
-	log.Println("Starting HTTPS server on " + baseURL + " ...")
-	if err := http.ListenAndServeTLS(":443", certFile, keyFile, mux); err != nil {
-		log.Fatal("Failed to start server:", err)
-	}
+    go func() {
+        httpMux := http.NewServeMux()
+        httpMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+            http.Redirect(w, r, "https://explorer.needgreatersglobal.com"+r.RequestURI, http.StatusMovedPermanently)
+        })
+        log.Println("Starting HTTP redirect server on :80...")
+        http.ListenAndServe(":80", httpMux)
+    }()
+    
+    // Start HTTPS server
+    log.Println("Starting HTTPS server on :443...")
+    if err := http.ListenAndServeTLS(":443", certFile, keyFile, mux); err != nil {
+        log.Fatal("Failed to start HTTPS server:", err)
+    }
 }
 
 // --- ROUTE SETUP ---
@@ -259,6 +271,7 @@ func setupRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/places", placesAPIHandler)
 	mux.HandleFunc("/api/places/submit", submitPlaceHandler)
 	mux.HandleFunc("/api/comment", requireAuth(commentHandler))
+    mux.HandleFunc("/api/comment/delete", requireAuth(deleteCommentHandler))
 	mux.HandleFunc("/api/counseling/submit", counselingSubmitHandler)
 
 	// --- Protected Routes ---
@@ -320,6 +333,7 @@ func initDB(filepath string) (*sql.DB, error) {
 		user_id INTEGER NOT NULL,
 		content TEXT NOT NULL,
 		image_url TEXT,
+        rating INTEGER DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY(place_id) REFERENCES places(id) ON DELETE CASCADE,
 		FOREIGN KEY(user_id) REFERENCES users(id)
@@ -339,6 +353,7 @@ func initDB(filepath string) (*sql.DB, error) {
 	db.Exec("ALTER TABLE users ADD COLUMN password_reset_token TEXT")
 	db.Exec("ALTER TABLE users ADD COLUMN reset_token_expiry DATETIME")
 	db.Exec("ALTER TABLE comments ADD COLUMN image_url TEXT")
+    db.Exec("ALTER TABLE comments ADD COLUMN rating INTEGER DEFAULT 0")
 
 	// Add sample admin user if not exists
 	var count int
@@ -1198,28 +1213,29 @@ func placeDetailHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get comments
-	rows, err := db.Query(`
-		SELECT c.id, c.content, c.image_url, c.created_at, u.username
-		FROM comments c
-		JOIN users u ON c.user_id = u.id
-		WHERE c.place_id = ?
-		ORDER BY c.created_at DESC
-	`, placeID)
+rows, err := db.Query(`
+SELECT c.id, c.user_id, c.content, c.image_url, c.rating, c.created_at, u.username
+FROM comments c
+JOIN users u ON c.user_id = u.id
+WHERE c.place_id = ?
+ORDER BY c.created_at DESC
+`, placeID)
 	if err != nil {
 		log.Printf("Error getting comments: %v", err)
 	}
 	defer rows.Close()
 
 	var comments []Comment
-	for rows.Next() {
-		var c Comment
-		var imageURL sql.NullString
-		rows.Scan(&c.ID, &c.Content, &imageURL, &c.CreatedAt, &c.Username)
-		if imageURL.Valid {
-			c.ImageURL = imageURL.String
-		}
-		comments = append(comments, c)
+for rows.Next() {
+	var c Comment
+	var imageURL sql.NullString
+	rows.Scan(&c.ID, &c.UserID, &c.Content, &imageURL, &c.Rating, &c.CreatedAt, &c.Username)
+	if imageURL.Valid {
+		c.ImageURL = imageURL.String
 	}
+	c.PlaceID = placeID  // Add this line to store place ID in comment
+	comments = append(comments, c)
+}
 
 	renderTemplate(w, "place_detail", PageBundle{
 		PageName: "place_detail",
@@ -1294,6 +1310,14 @@ func commentHandler(w http.ResponseWriter, r *http.Request) {
 
 	placeID, _ := strconv.Atoi(r.FormValue("place_id"))
 	content := r.FormValue("content")
+	// --- FIX: Removed invisible spaces from the line below ---
+	rating, _ := strconv.Atoi(r.FormValue("rating"))
+
+	// --- FIX: Removed invisible spaces from this "if" block ---
+	if rating < 1 || rating > 5 {
+		http.Error(w, "Rating must be between 1 and 5", http.StatusBadRequest)
+		return
+	}
 
 	if content == "" {
 		http.Error(w, "Comment cannot be empty", http.StatusBadRequest)
@@ -1334,10 +1358,11 @@ func commentHandler(w http.ResponseWriter, r *http.Request) {
 		imageURL = "/uploads/" + filename
 	}
 
+	// This code will now work because the "rating" variable is correctly named
 	_, err = db.Exec(`
-		INSERT INTO comments (place_id, user_id, content, image_url)
-		VALUES (?, ?, ?, ?)
-	`, placeID, user.ID, content, imageURL)
+		INSERT INTO comments (place_id, user_id, content, image_url, rating)
+		VALUES (?, ?, ?, ?, ?)
+	`, placeID, user.ID, content, imageURL, rating)
 
 	if err != nil {
 		log.Printf("Error adding comment: %v", err)
@@ -1345,6 +1370,47 @@ func commentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	http.Redirect(w, r, fmt.Sprintf("/place/%d", placeID), http.StatusSeeOther)
+}
+
+func deleteCommentHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	user, err := getCurrentUser(r)
+	if err != nil {
+		http.Error(w, "Authentication required", http.StatusUnauthorized)
+		return
+	}
+
+	commentID, _ := strconv.Atoi(r.FormValue("comment_id"))
+	placeID, _ := strconv.Atoi(r.FormValue("place_id"))
+
+	// Check if user owns the comment or is admin
+	var commentUserID int
+	err = db.QueryRow("SELECT user_id FROM comments WHERE id = ?", commentID).Scan(&commentUserID)
+	if err != nil {
+		http.Error(w, "Comment not found", http.StatusNotFound)
+		return
+	}
+
+	// Only allow deletion if user owns comment or is admin
+	if commentUserID != user.ID && !user.IsAdmin {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Delete the comment
+	_, err = db.Exec("DELETE FROM comments WHERE id = ?", commentID)
+	if err != nil {
+		log.Printf("Error deleting comment: %v", err)
+		http.Error(w, "Failed to delete comment", http.StatusInternalServerError)
+		return
+	}
+
+	// Redirect back to the place detail page
 	http.Redirect(w, r, fmt.Sprintf("/place/%d", placeID), http.StatusSeeOther)
 }
 
@@ -2174,6 +2240,11 @@ const allTemplates = `
             font-size: 0.9rem;
             color: var(--text-gray);
         }
+        
+        .comment form button:hover {
+    background: rgba(244, 67, 54, 0.1) !important;
+    border-radius: 5px;
+}
 
         .comment-content {
             color: var(--text-light);
@@ -2384,7 +2455,88 @@ const allTemplates = `
                 width: 100%;
             }
         }
+    
+        /* Star Rating Styles */
+.star-rating {
+    display: flex;
+    gap: 0.25rem;
+    font-size: 1.5rem;
+    margin: 0.5rem 0;
+}
 
+.star-rating input[type="radio"] {
+    display: none;
+}
+
+.star-rating label {
+    cursor: pointer;
+    color: var(--text-gray);
+    transition: color 0.2s;
+}
+
+.star-rating label:before {
+    content: '★';
+}
+/* For checked state */
+.star-rating input[type="radio"]:checked ~ label {
+    color: #ffd700;
+}
+
+/* For hover - we need to target all previous labels */
+.star-rating label:hover {
+    color: #ffd700;
+}
+
+/* This is the key fix - use has() selector for modern browsers */
+.star-rating:has(label:hover) label {
+    color: var(--text-gray);
+}
+
+.star-rating label:hover,
+.star-rating label:hover ~ label {
+    color: var(--text-gray);
+}
+
+.star-rating input[type="radio"]:checked ~ label,
+.star-rating input[type="radio"]:checked ~ label ~ label {
+    color: var(--text-gray);
+}
+
+/* Highlight from start to current */
+.star-rating input[type="radio"]:nth-child(1):checked ~ label:nth-child(2),
+.star-rating input[type="radio"]:nth-child(3):checked ~ label:nth-child(2),
+.star-rating input[type="radio"]:nth-child(3):checked ~ label:nth-child(4),
+.star-rating input[type="radio"]:nth-child(5):checked ~ label:nth-child(2),
+.star-rating input[type="radio"]:nth-child(5):checked ~ label:nth-child(4),
+.star-rating input[type="radio"]:nth-child(5):checked ~ label:nth-child(6),
+.star-rating input[type="radio"]:nth-child(7):checked ~ label:nth-child(2),
+.star-rating input[type="radio"]:nth-child(7):checked ~ label:nth-child(4),
+.star-rating input[type="radio"]:nth-child(7):checked ~ label:nth-child(6),
+.star-rating input[type="radio"]:nth-child(7):checked ~ label:nth-child(8),
+.star-rating input[type="radio"]:nth-child(9):checked ~ label:nth-child(2),
+.star-rating input[type="radio"]:nth-child(9):checked ~ label:nth-child(4),
+.star-rating input[type="radio"]:nth-child(9):checked ~ label:nth-child(6),
+.star-rating input[type="radio"]:nth-child(9):checked ~ label:nth-child(8),
+.star-rating input[type="radio"]:nth-child(9):checked ~ label:nth-child(10) {
+    color: #ffd700;
+}
+
+.star-rating-display {
+    color: #ffd700;
+    font-size: 1.2rem;
+}
+
+.average-rating {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 1rem 0;
+    font-size: 1.1rem;
+}
+
+.stars-display {
+    color: #ffd700;
+}
         /* Extra small devices */
         @media (max-width: 480px) {
             .hero h1 {
@@ -3050,6 +3202,21 @@ const allTemplates = `
         {{if .CurrentUser.ID}}
         <form action="/api/comment" method="POST" enctype="multipart/form-data" style="margin-bottom: 2rem;">
             <input type="hidden" name="place_id" value="{{.Data.Place.ID}}">
+              <div class="form-group">
+                <label>Your Rating*</label>
+              <div class="star-rating">
+    <input type="radio" name="rating" id="star1" value="1" required>
+    <label for="star1"></label>
+    <input type="radio" name="rating" id="star2" value="2">
+    <label for="star2"></label>
+    <input type="radio" name="rating" id="star3" value="3">
+    <label for="star3"></label>
+    <input type="radio" name="rating" id="star4" value="4">
+    <label for="star4"></label>
+    <input type="radio" name="rating" id="star5" value="5">
+    <label for="star5"></label>
+</div>
+            </div>
             <div class="form-group">
                 <label for="content">Add a comment</label>
                 <textarea id="content" name="content" rows="3" required placeholder="Share your experience..."></textarea>
@@ -3067,26 +3234,91 @@ const allTemplates = `
         </p>
         {{end}}
 
-        {{range .Data.Comments}}
-        <div class="comment">
-            <div class="comment-header">
-                <strong>{{.Username}}</strong>
-                <span>{{.CreatedAt.Format "Jan 2, 2006 at 3:04 PM"}}</span>
-            </div>
-            <div class="comment-content">
-                {{.Content}}
-            </div>
-            {{if .ImageURL}}
-            <div style="margin-top: 1rem;">
-                <img src="{{.ImageURL}}" alt="Comment image" style="max-width: 100%; max-height: 400px; border-radius: 10px; object-fit: contain;">
-            </div>
+       {{range .Data.Comments}}
+<div class="comment" style="position: relative;">
+    <div class="comment-header">
+        <strong>{{.Username}}</strong>
+        <div style="display: flex; align-items: center; gap: 1rem;">
+            <span>{{.CreatedAt.Format "Jan 2, 2006 at 3:04 PM"}}</span>
+            {{if or (eq $.CurrentUser.ID .UserID) $.CurrentUser.IsAdmin}}
+            <form action="/api/comment/delete" method="POST" style="margin: 0;" onsubmit="return confirm('Are you sure you want to delete this comment?');">
+                <input type="hidden" name="comment_id" value="{{.ID}}">
+                <input type="hidden" name="place_id" value="{{$.Data.Place.ID}}">
+                <button type="submit" style="background: none; border: none; color: #f44336; cursor: pointer; font-size: 0.9rem; padding: 0.25rem 0.5rem; border-radius: 5px; transition: background 0.3s;">
+                    🗑️ Delete
+                </button>
+            </form>
             {{end}}
         </div>
-        {{else}}
-        <p style="color: var(--text-gray);">No comments yet. Be the first to share your thoughts!</p>
-        {{end}}
+    </div>
+    {{if gt .Rating 0}}
+    <div class="star-rating-display" style="color: #ffd700; font-size: 1.2rem; margin: 0.5rem 0;">
+        {{if ge .Rating 1}}★{{else}}☆{{end}}{{if ge .Rating 2}}★{{else}}☆{{end}}{{if ge .Rating 3}}★{{else}}☆{{end}}{{if ge .Rating 4}}★{{else}}☆{{end}}{{if ge .Rating 5}}★{{else}}☆{{end}}
+    </div>
+    {{end}}
+    <div class="comment-content">
+        {{.Content}}
+    </div>
+    {{if .ImageURL}}
+    <div style="margin-top: 1rem;">
+        <img src="{{.ImageURL}}" alt="Comment image" style="max-width: 100%; max-height: 400px; border-radius: 10px; object-fit: contain;">
+    </div>
+    {{end}}
+</div>
+{{else}}
+<p style="color: var(--text-gray);">No comments yet. Be the first to share your thoughts!</p>
+{{end}}
     </div>
 </div>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const starRating = document.querySelector('.star-rating');
+    if (starRating) {
+        const labels = starRating.querySelectorAll('label');
+        const inputs = starRating.querySelectorAll('input[type="radio"]');
+        
+        // Handle hover
+        labels.forEach((label, index) => {
+            label.addEventListener('mouseenter', function() {
+                labels.forEach((l, i) => {
+                    if (i <= index) {
+                        l.style.color = '#ffd700';
+                    } else {
+                        l.style.color = 'var(--text-gray)';
+                    }
+                });
+            });
+        });
+        
+        // Reset on mouse leave
+        starRating.addEventListener('mouseleave', function() {
+            updateStars();
+        });
+        
+        // Update stars based on checked input
+        function updateStars() {
+            const checkedInput = starRating.querySelector('input[type="radio"]:checked');
+            const checkedValue = checkedInput ? parseInt(checkedInput.value) : 0;
+            
+            labels.forEach((label, index) => {
+                if (index < checkedValue) {
+                    label.style.color = '#ffd700';
+                } else {
+                    label.style.color = 'var(--text-gray)';
+                }
+            });
+        }
+        
+        // Handle click
+        inputs.forEach(input => {
+            input.addEventListener('change', updateStars);
+        });
+        
+        // Initial update
+        updateStars();
+    }
+});
+</script>
 {{end}}
 
 {{define "chat"}}
